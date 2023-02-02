@@ -17,7 +17,6 @@
 
 #include "lib/jpegli/common_internal.h"
 #include "lib/jpegli/encode.h"
-#include "lib/jxl/image.h"
 
 namespace jpegli {
 
@@ -40,6 +39,8 @@ struct JPEGHuffmanCode {
 // DCTCodingState: maximum number of correction bits to buffer
 const int kJPEGMaxCorrectionBits = 1u << 16;
 
+constexpr int kDefaultProgressiveLevel = 2;
+
 struct HuffmanCodeTable {
   int depth[256];
   int code[256];
@@ -57,12 +58,13 @@ typedef int16_t coeff_t;
 }  // namespace jpegli
 
 struct jpeg_comp_master {
-  jxl::Image3F input;
+  std::array<jpegli::RowBuffer<float>, jpegli::kMaxComponents> input_buffer;
   float distance = 1.0;
+  bool force_baseline = true;
   bool xyb_mode = false;
   bool use_std_tables = false;
   bool use_adaptive_quantization = true;
-  int progressive_level = 2;
+  int progressive_level = jpegli::kDefaultProgressiveLevel;
   size_t xsize_blocks = 0;
   size_t ysize_blocks = 0;
   std::vector<jpegli::ScanCodingInfo> scan_coding_info;
@@ -72,7 +74,7 @@ struct jpeg_comp_master {
   JpegliEndianness endianness = JPEGLI_NATIVE_ENDIAN;
   std::array<jpegli::HuffmanCodeTable, jpegli::kMaxHuffmanTables> dc_huff_table;
   std::array<jpegli::HuffmanCodeTable, jpegli::kMaxHuffmanTables> ac_huff_table;
-  jxl::ImageF quant_field;
+  jpegli::RowBuffer<float> quant_field;
   float quant_field_max;
 };
 
