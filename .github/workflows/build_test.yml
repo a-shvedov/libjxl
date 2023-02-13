@@ -13,6 +13,8 @@ on:
       - v*.*.x
   pull_request:
     types: [opened, reopened, labeled, synchronize]
+    paths-ignore:
+      - '**md'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
@@ -115,6 +117,7 @@ jobs:
     steps:
     - name: Install build deps
       run: |
+        sudo rm -f /var/lib/man-db/auto-update
         sudo apt update
         sudo apt install -y \
           ccache \
@@ -367,6 +370,7 @@ jobs:
       shell: bash
       run: |
         set -x
+        sudo rm -f /var/lib/man-db/auto-update
         sudo apt update
         pkgs=(
           # Build dependencies

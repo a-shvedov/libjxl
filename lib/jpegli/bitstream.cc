@@ -456,6 +456,24 @@ void WriteOutput(j_compress_ptr cinfo, std::initializer_list<uint8_t> bytes) {
   WriteOutput(cinfo, bytes.begin(), bytes.size());
 }
 
+void EncodeAPP0(j_compress_ptr cinfo) {
+  WriteOutput(cinfo,
+              {0xff, 0xe0, 0, 16, 'J', 'F', 'I', 'F', '\0',
+               cinfo->JFIF_major_version, cinfo->JFIF_minor_version,
+               cinfo->density_unit, static_cast<uint8_t>(cinfo->X_density >> 8),
+               static_cast<uint8_t>(cinfo->X_density & 0xff),
+               static_cast<uint8_t>(cinfo->Y_density >> 8),
+               static_cast<uint8_t>(cinfo->Y_density & 0xff), 0, 0});
+}
+
+void EncodeAPP14(j_compress_ptr cinfo) {
+  uint8_t color_transform = cinfo->jpeg_color_space == JCS_YCbCr  ? 1
+                            : cinfo->jpeg_color_space == JCS_YCCK ? 2
+                                                                  : 0;
+  WriteOutput(cinfo, {0xff, 0xee, 0, 14, 'A', 'd', 'o', 'b', 'e', 0, 100, 0, 0,
+                      0, 0, color_transform});
+}
+
 void EncodeSOF(j_compress_ptr cinfo) {
   const uint8_t marker = cinfo->progressive_mode ? 0xc2 : 0xc1;
   const size_t n_comps = cinfo->num_components;
@@ -507,20 +525,23 @@ void EncodeSOS(j_compress_ptr cinfo, int scan_index) {
   WriteOutput(cinfo, data);
 }
 
-void EncodeDHT(j_compress_ptr cinfo,
-               const std::vector<JPEGHuffmanCode>& huffman_code,
-               size_t* next_huffman_code, size_t num_huffman_codes) {
+void EncodeDHT(j_compress_ptr cinfo, const JPEGHuffmanCode* huffman_codes,
+               size_t num_huffman_codes) {
   if (num_huffman_codes == 0) {
     return;
   }
 
   size_t marker_len = 2;
   for (size_t i = 0; i < num_huffman_codes; ++i) {
-    const JPEGHuffmanCode& huff = huffman_code[*next_huffman_code + i];
+    const JPEGHuffmanCode& huff = huffman_codes[i];
+    if (huff.sent_table) continue;
     marker_len += kJpegHuffmanMaxBitLength;
     for (size_t j = 0; j < huff.counts.size(); ++j) {
       marker_len += huff.counts[j];
     }
+  }
+  if (marker_len == 2) {
+    return;
   }
   std::vector<uint8_t> data(marker_len + 2);
   size_t pos = 0;
@@ -529,8 +550,7 @@ void EncodeDHT(j_compress_ptr cinfo,
   data[pos++] = marker_len >> 8u;
   data[pos++] = marker_len & 0xFFu;
   for (size_t i = 0; i < num_huffman_codes; ++i) {
-    const size_t huffman_code_index = *next_huffman_code + i;
-    const JPEGHuffmanCode& huff = huffman_code[huffman_code_index];
+    const JPEGHuffmanCode& huff = huffman_codes[i];
     size_t index = huff.slot_id;
     HuffmanCodeTable* huff_table;
     if (index & 0x10) {
@@ -544,6 +564,7 @@ void EncodeDHT(j_compress_ptr cinfo,
     if (!BuildHuffmanCodeTable(huff, huff_table)) {
       JPEGLI_ERROR("Failed to build Huffman code table.");
     }
+    if (huff.sent_table) continue;
     size_t total_count = 0;
     size_t max_length = 0;
     for (size_t i = 0; i < huff.counts.size(); ++i) {
@@ -560,11 +581,7 @@ void EncodeDHT(j_compress_ptr cinfo,
     for (size_t i = 0; i < total_count; ++i) {
       data[pos++] = huff.values[i];
     }
-    if (i + 1 == num_huffman_codes) {
-      JXL_ASSERT(huff.is_last);
-    }
   }
-  *next_huffman_code += num_huffman_codes;
   WriteOutput(cinfo, data);
 }
 
@@ -595,9 +612,11 @@ void EncodeDQT(j_compress_ptr cinfo) {
     }
     quant_table->sent_table = TRUE;
   }
-  data[2] = (pos - 2) >> 8u;
-  data[3] = (pos - 2) & 0xFFu;
-  WriteOutput(cinfo, data, pos);
+  if (pos > 4) {
+    data[2] = (pos - 2) >> 8u;
+    data[3] = (pos - 2) & 0xFFu;
+    WriteOutput(cinfo, data, pos);
+  }
 }
 
 bool EncodeDRI(j_compress_ptr cinfo) {
@@ -645,6 +664,7 @@ bool EncodeScan(j_compress_ptr cinfo,
   const int Ah = scan_info->Ah;
   const int Ss = scan_info->Ss;
   const int Se = scan_info->Se;
+  constexpr coeff_t kDummyBlock[DCTSIZE2] = {0};
 
   for (int mcu_y = 0; mcu_y < MCU_rows; ++mcu_y) {
     for (int mcu_x = 0; mcu_x < MCUs_per_row; ++mcu_x) {
@@ -668,11 +688,15 @@ bool EncodeScan(j_compress_ptr cinfo,
         int n_blocks_x = is_interleaved ? comp->h_samp_factor : 1;
         for (int iy = 0; iy < n_blocks_y; ++iy) {
           for (int ix = 0; ix < n_blocks_x; ++ix) {
-            int block_y = mcu_y * n_blocks_y + iy;
-            int block_x = mcu_x * n_blocks_x + ix;
-            int block_idx = block_y * comp->width_in_blocks + block_x;
-            int num_zero_runs = 0;
+            size_t block_y = mcu_y * n_blocks_y + iy;
+            size_t block_x = mcu_x * n_blocks_x + ix;
+            size_t block_idx = block_y * comp->width_in_blocks + block_x;
+            size_t num_zero_runs = 0;
             const coeff_t* block = &coeffs[comp_idx][block_idx << 6];
+            if (block_x >= comp->width_in_blocks ||
+                block_y >= comp->height_in_blocks) {
+              block = kDummyBlock;
+            }
             bool ok;
             if (!is_progressive) {
               ok = EncodeDCTBlockSequential(block, dc_huff, ac_huff,
