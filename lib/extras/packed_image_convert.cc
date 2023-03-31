@@ -5,10 +5,11 @@
 
 #include "lib/extras/packed_image_convert.h"
 
+#include <jxl/color_encoding.h>
+#include <jxl/types.h>
+
 #include <cstdint>
 
-#include "jxl/color_encoding.h"
-#include "jxl/types.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/color_management.h"
@@ -168,14 +169,12 @@ Status ConvertPackedPixelFileToCodecInOut(const PackedPixelFile& ppf,
   }
 
   // Convert the pixels
-  io->dec_pixels = 0;
   io->frames.clear();
   for (const auto& frame : ppf.frames) {
     ImageBundle bundle(&io->metadata.m);
     JXL_RETURN_IF_ERROR(
         ConvertPackedFrameToImageBundle(ppf.info, frame, *io, pool, &bundle));
     io->frames.push_back(std::move(bundle));
-    io->dec_pixels += frame.color.xsize * frame.color.ysize;
   }
 
   if (ppf.info.exponent_bits_per_sample == 0) {
@@ -275,10 +274,6 @@ Status ConvertCodecInOutToPackedPixelFile(const CodecInOut& io,
     JXL_RETURN_IF_ERROR(TransformIfNeeded(*to_color_transform, c_desired,
                                           GetJxlCms(), pool, &store,
                                           &transformed));
-    size_t stride = ib.oriented_xsize() *
-                    (c_desired.Channels() * ppf->info.bits_per_sample) /
-                    kBitsPerByte;
-    PaddedBytes pixels(stride * ib.oriented_ysize());
 
     JXL_RETURN_IF_ERROR(ConvertToExternal(
         *transformed, bits_per_sample, float_out, format.num_channels,

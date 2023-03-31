@@ -78,6 +78,10 @@ JDIMENSION jpeg_read_raw_data(j_decompress_ptr cinfo, JSAMPIMAGE data,
   return jpegli_read_raw_data(cinfo, data, max_lines);
 }
 
+jvirt_barray_ptr *jpeg_read_coefficients(j_decompress_ptr cinfo) {
+  return jpegli_read_coefficients(cinfo);
+}
+
 boolean jpeg_has_multiple_scans(j_decompress_ptr cinfo) {
   return jpegli_has_multiple_scans(cinfo);
 }
@@ -177,6 +181,11 @@ void jpeg_suppress_tables(j_compress_ptr cinfo, boolean suppress) {
   jpegli_suppress_tables(cinfo, suppress);
 }
 
+void jpeg_copy_critical_parameters(j_decompress_ptr srcinfo,
+                                   j_compress_ptr dstinfo) {
+  jpegli_copy_critical_parameters(srcinfo, dstinfo);
+}
+
 void jpeg_write_m_header(j_compress_ptr cinfo, int marker,
                          unsigned int datalen) {
   jpegli_write_m_header(cinfo, marker, datalen);
@@ -230,3 +239,5 @@ void jpeg_destroy_compress(j_compress_ptr cinfo) {
 boolean jpeg_resync_to_restart(j_decompress_ptr cinfo, int desired) {
   return jpegli_resync_to_restart(cinfo, desired);
 }
+
+void jpeg_new_colormap(j_decompress_ptr cinfo) { jpegli_new_colormap(cinfo); }

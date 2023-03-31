@@ -5,15 +5,15 @@
 
 #include "tools/box/box.h"
 
+#include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
-#include "gtest/gtest.h"
-#include "lib/jxl/base/file_io.h"
-#include "lib/jxl/base/override.h"
+#include <utility>
+
 #include "lib/jxl/base/padded_bytes.h"
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/testing.h"
 
 TEST(BoxTest, BoxTest) {
   size_t test_size = 256;

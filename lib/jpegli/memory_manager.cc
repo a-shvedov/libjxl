@@ -7,8 +7,10 @@
 
 #include <string.h>
 
+#include <hwy/aligned_allocator.h>
 #include <vector>
 
+#include "lib/jpegli/common_internal.h"
 #include "lib/jpegli/error.h"
 
 struct jvirt_sarray_control {
@@ -32,16 +34,17 @@ struct MemoryManager {
   std::vector<std::vector<void*>> owned_ptrs;
 };
 
-void CheckPoolId(j_common_ptr cinfo, int pool_id) {
-  if (pool_id < 0 || pool_id >= JPOOL_NUMPOOLS) {
-    JPEGLI_ERROR("Invalid pool id %d", pool_id);
-  }
-}
-
 void* Alloc(j_common_ptr cinfo, int pool_id, size_t sizeofobject) {
   MemoryManager* mem = reinterpret_cast<MemoryManager*>(cinfo->mem);
-  CheckPoolId(cinfo, pool_id);
-  void* p = malloc(sizeofobject);
+  if (pool_id < 0 || pool_id >= 2 * JPOOL_NUMPOOLS) {
+    JPEGLI_ERROR("Invalid pool id %d", pool_id);
+  }
+  void* p;
+  if (pool_id < JPOOL_NUMPOOLS) {
+    p = malloc(sizeofobject);
+  } else {
+    p = hwy::AllocateAlignedBytes(sizeofobject, nullptr, nullptr);
+  }
   if (p == nullptr) {
     JPEGLI_ERROR("Out of memory");
   }
@@ -53,8 +56,14 @@ template <typename T>
 T** Alloc2dArray(j_common_ptr cinfo, int pool_id, JDIMENSION samplesperrow,
                  JDIMENSION numrows) {
   T** array = Allocate<T*>(cinfo, numrows, pool_id);
+  // Always use aligned allocator for large 2d arrays.
+  if (pool_id < JPOOL_NUMPOOLS) {
+    pool_id += JPOOL_NUMPOOLS;
+  }
+  size_t stride = RoundUpTo(samplesperrow, HWY_ALIGNMENT);
+  T* buffer = Allocate<T>(cinfo, numrows * stride, pool_id);
   for (size_t i = 0; i < numrows; ++i) {
-    array[i] = Allocate<T>(cinfo, samplesperrow, pool_id);
+    array[i] = &buffer[i * stride];
   }
   return array;
 }
@@ -101,11 +110,17 @@ T** AccessVirtualArray(j_common_ptr cinfo, Control* ptr, JDIMENSION start_row,
 
 void FreePool(j_common_ptr cinfo, int pool_id) {
   MemoryManager* mem = reinterpret_cast<MemoryManager*>(cinfo->mem);
-  CheckPoolId(cinfo, pool_id);
+  if (pool_id < 0 || pool_id >= JPOOL_NUMPOOLS) {
+    JPEGLI_ERROR("Invalid pool id %d", pool_id);
+  }
   for (void* ptr : mem->owned_ptrs[pool_id]) {
     free(ptr);
   }
   mem->owned_ptrs[pool_id].clear();
+  for (void* ptr : mem->owned_ptrs[JPOOL_NUMPOOLS + pool_id]) {
+    hwy::FreeAlignedBytes(ptr, nullptr, nullptr);
+  }
+  mem->owned_ptrs[JPOOL_NUMPOOLS + pool_id].clear();
 }
 
 void SelfDestruct(j_common_ptr cinfo) {
@@ -136,7 +151,7 @@ void InitMemoryManager(j_common_ptr cinfo) {
       jpegli::AccessVirtualArray<jvirt_barray_control, JBLOCK>;
   mem->pub.free_pool = jpegli::FreePool;
   mem->pub.self_destruct = jpegli::SelfDestruct;
-  mem->owned_ptrs.resize(JPOOL_NUMPOOLS);
+  mem->owned_ptrs.resize(2 * JPOOL_NUMPOOLS);
   cinfo->mem = reinterpret_cast<struct jpeg_memory_mgr*>(mem);
 }
 

@@ -3,11 +3,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "jxl/butteraugli.h"
+#include <jxl/butteraugli.h>
+#include <jxl/butteraugli_cxx.h>
 
-#include "gtest/gtest.h"
-#include "jxl/butteraugli_cxx.h"
+#include "lib/jxl/test_image.h"
 #include "lib/jxl/test_utils.h"
+#include "lib/jxl/testing.h"
 
 TEST(ButteraugliTest, Lossless) {
   uint32_t xsize = 171;

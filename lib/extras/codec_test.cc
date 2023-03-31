@@ -20,7 +20,6 @@
 #include "lib/extras/enc/encode.h"
 #include "lib/extras/packed_image_convert.h"
 #include "lib/jxl/base/random.h"
-#include "lib/jxl/base/thread_pool_internal.h"
 #include "lib/jxl/color_management.h"
 #include "lib/jxl/enc_butteraugli_comparator.h"
 #include "lib/jxl/enc_color_management.h"
@@ -28,9 +27,12 @@
 #include "lib/jxl/image_bundle.h"
 #include "lib/jxl/image_test_utils.h"
 #include "lib/jxl/test_utils.h"
-#include "lib/jxl/testdata.h"
+#include "lib/jxl/testing.h"
 
 namespace jxl {
+
+using test::ThreadPoolForTests;
+
 namespace extras {
 namespace {
 
@@ -275,7 +277,7 @@ void TestRoundTrip(const TestImageParams& params, ThreadPool* pool) {
                     params.is_gray ? "Gra_D65_Rel_SRG" : "RGB_D65_SRG_Rel_SRG");
   }
   ASSERT_TRUE(DecodeBytes(Span<const uint8_t>(encoded.bitstreams[0]),
-                          color_hints, SizeConstraints(), &ppf_out));
+                          color_hints, &ppf_out));
   if (params.codec == Codec::kPNG && ppf_out.icc.empty()) {
     // Decoding a PNG may drop the ICC profile if there's a valid cICP chunk.
     // Rendering intent is not preserved in this case.
@@ -315,7 +317,7 @@ void TestRoundTrip(const TestImageParams& params, ThreadPool* pool) {
 }
 
 TEST(CodecTest, TestRoundTrip) {
-  ThreadPoolInternal pool(12);
+  ThreadPoolForTests pool(12);
 
   TestImageParams params;
   params.xsize = 7;
@@ -345,7 +347,7 @@ TEST(CodecTest, TestRoundTrip) {
 }
 
 TEST(CodecTest, LosslessPNMRoundtrip) {
-  ThreadPoolInternal pool(12);
+  ThreadPoolForTests pool(12);
 
   static const char* kChannels[] = {"", "g", "ga", "rgb", "rgba"};
   static const char* kExtension[] = {"", ".pgm", ".pam", ".ppm", ".pam"};
@@ -356,14 +358,14 @@ TEST(CodecTest, LosslessPNMRoundtrip) {
       std::string filename = "jxl/flower/flower_small." +
                              std::string(kChannels[channels]) + ".depth" +
                              std::to_string(bit_depth) + extension;
-      const PaddedBytes orig = ReadTestData(filename);
+      const PaddedBytes orig = jxl::test::ReadTestData(filename);
 
       PackedPixelFile ppf;
       ColorHints color_hints;
       color_hints.Add("color_space",
                       channels < 3 ? "Gra_D65_Rel_SRG" : "RGB_D65_SRG_Rel_SRG");
       ASSERT_TRUE(DecodeBytes(Span<const uint8_t>(orig.data(), orig.size()),
-                              color_hints, SizeConstraints(), &ppf));
+                              color_hints, &ppf));
 
       EncodedImage encoded;
       auto encoder = Encoder::FromExtension(extension);
@@ -377,12 +379,11 @@ TEST(CodecTest, LosslessPNMRoundtrip) {
   }
 }
 
-CodecInOut DecodeRoundtrip(const std::string& pathname, ThreadPool* pool,
-                           const ColorHints& color_hints = ColorHints()) {
-  CodecInOut io;
-  const PaddedBytes orig = ReadTestData(pathname);
-  JXL_CHECK(
-      SetFromBytes(Span<const uint8_t>(orig), color_hints, &io, pool, nullptr));
+void DecodeRoundtrip(const std::string& pathname, ThreadPool* pool,
+                     CodecInOut& io,
+                     const ColorHints& color_hints = ColorHints()) {
+  const PaddedBytes orig = jxl::test::ReadTestData(pathname);
+  JXL_CHECK(SetFromBytes(Span<const uint8_t>(orig), color_hints, &io, pool));
   const ImageBundle& ib1 = io.Main();
 
   // Encode/Decode again to make sure Encode carries through all metadata.
@@ -391,8 +392,8 @@ CodecInOut DecodeRoundtrip(const std::string& pathname, ThreadPool* pool,
                    io.metadata.m.bit_depth.bits_per_sample, &encoded, pool));
 
   CodecInOut io2;
-  JXL_CHECK(SetFromBytes(Span<const uint8_t>(encoded), color_hints, &io2, pool,
-                         nullptr));
+  JXL_CHECK(
+      SetFromBytes(Span<const uint8_t>(encoded), color_hints, &io2, pool));
   const ImageBundle& ib2 = io2.Main();
   EXPECT_EQ(Description(ib1.metadata()->color_encoding),
             Description(ib2.metadata()->color_encoding));
@@ -410,20 +411,19 @@ CodecInOut DecodeRoundtrip(const std::string& pathname, ThreadPool* pool,
     max_l1 *= 1.5;
     max_rel *= 3.0;
   }
-  VerifyRelativeError(ib1.color(), ib2.color(), max_l1, max_rel);
+  JXL_ASSERT_OK(
+      VerifyRelativeError(ib1.color(), ib2.color(), max_l1, max_rel, _));
 
   // Simulate the encoder removing profile and decoder restoring it.
   if (!ib2.metadata()->color_encoding.WantICC()) {
     io2.metadata.m.color_encoding.InternalRemoveICC();
     EXPECT_TRUE(io2.metadata.m.color_encoding.CreateICC());
   }
-
-  return io2;
 }
 
 #if 0
 TEST(CodecTest, TestMetadataSRGB) {
-  ThreadPoolInternal pool(12);
+  ThreadPoolForTests pool(12);
 
   const char* paths[] = {"external/raw.pixls/DJI-FC6310-16bit_srgb8_v4_krita.png",
                          "external/raw.pixls/Google-Pixel2XL-16bit_srgb8_v4_krita.png",
@@ -431,8 +431,8 @@ TEST(CodecTest, TestMetadataSRGB) {
                          "external/raw.pixls/Nikon-D300-12bit_srgb8_dt.png",
                          "external/raw.pixls/Sony-DSC-RX1RM2-14bit_srgb8_v4_krita.png"};
   for (const char* relative_pathname : paths) {
-    const CodecInOut io =
-        DecodeRoundtrip(relative_pathname, Codec::kPNG, &pool);
+    CodecInOut io;
+    DecodeRoundtrip(relative_pathname, Codec::kPNG, &pool, io);
     EXPECT_EQ(8, io.metadata.m.bit_depth.bits_per_sample);
     EXPECT_FALSE(io.metadata.m.bit_depth.floating_point_sample);
     EXPECT_EQ(0, io.metadata.m.bit_depth.exponent_bits_per_sample);
@@ -451,7 +451,7 @@ TEST(CodecTest, TestMetadataSRGB) {
 }
 
 TEST(CodecTest, TestMetadataLinear) {
-  ThreadPoolInternal pool(12);
+  ThreadPoolForTests pool(12);
 
   const char* paths[3] = {
       "external/raw.pixls/Google-Pixel2XL-16bit_acescg_g1_v4_krita.png",
@@ -464,7 +464,8 @@ TEST(CodecTest, TestMetadataLinear) {
                                   Primaries::k2100};
 
   for (size_t i = 0; i < 3; ++i) {
-    const CodecInOut io = DecodeRoundtrip(paths[i], Codec::kPNG, &pool);
+    CodecInOut io;
+    DecodeRoundtrip(paths[i], Codec::kPNG, &pool, io);
     EXPECT_EQ(16, io.metadata.m.bit_depth.bits_per_sample);
     EXPECT_FALSE(io.metadata.m.bit_depth.floating_point_sample);
     EXPECT_EQ(0, io.metadata.m.bit_depth.exponent_bits_per_sample);
@@ -483,15 +484,15 @@ TEST(CodecTest, TestMetadataLinear) {
 }
 
 TEST(CodecTest, TestMetadataICC) {
-  ThreadPoolInternal pool(12);
+  ThreadPoolForTests pool(12);
 
   const char* paths[] = {
       "external/raw.pixls/DJI-FC6310-16bit_709_v4_krita.png",
       "external/raw.pixls/Sony-DSC-RX1RM2-14bit_709_v4_krita.png",
   };
   for (const char* relative_pathname : paths) {
-    const CodecInOut io =
-        DecodeRoundtrip(relative_pathname, Codec::kPNG, &pool);
+    CodecInOut io;
+    DecodeRoundtrip(relative_pathname, Codec::kPNG, &pool, io);
     EXPECT_GE(16, io.metadata.m.bit_depth.bits_per_sample);
     EXPECT_LE(14, io.metadata.m.bit_depth.bits_per_sample);
 
@@ -510,34 +511,38 @@ TEST(CodecTest, TestMetadataICC) {
 }
 
 TEST(CodecTest, Testexternal/pngsuite) {
-  ThreadPoolInternal pool(12);
+  ThreadPoolForTests pool(12);
 
   // Ensure we can load PNG with text, japanese UTF-8, compressed text.
-  (void)DecodeRoundtrip("external/pngsuite/ct1n0g04.png", Codec::kPNG, &pool);
-  (void)DecodeRoundtrip("external/pngsuite/ctjn0g04.png", Codec::kPNG, &pool);
-  (void)DecodeRoundtrip("external/pngsuite/ctzn0g04.png", Codec::kPNG, &pool);
+  CodecInOut tmp1;
+  DecodeRoundtrip("external/pngsuite/ct1n0g04.png", Codec::kPNG, &pool, tmp1);
+  CodecInOut tmp2;
+  DecodeRoundtrip("external/pngsuite/ctjn0g04.png", Codec::kPNG, &pool, tmp2);
+  CodecInOut tmp3;
+  DecodeRoundtrip("external/pngsuite/ctzn0g04.png", Codec::kPNG, &pool, tmp3);
 
   // Extract gAMA
-  const CodecInOut b1 =
-      DecodeRoundtrip("external/pngsuite/g10n3p04.png", Codec::kPNG, &pool);
+  CodecInOut b1;
+  DecodeRoundtrip("external/pngsuite/g10n3p04.png", Codec::kPNG, &pool, b1);
   EXPECT_TRUE(b1.metadata.color_encoding.tf.IsLinear());
 
   // Extract cHRM
-  const CodecInOut b_p =
-      DecodeRoundtrip("external/pngsuite/ccwn2c08.png", Codec::kPNG, &pool);
+  CodecInOut b_p;
+  DecodeRoundtrip("external/pngsuite/ccwn2c08.png", Codec::kPNG, &pool, b_p);
   EXPECT_EQ(Primaries::kSRGB, b_p.metadata.color_encoding.primaries);
   EXPECT_EQ(WhitePoint::kD65, b_p.metadata.color_encoding.white_point);
 
   // Extract EXIF from (new-style) dedicated chunk
-  const CodecInOut b_exif =
-      DecodeRoundtrip("external/pngsuite/exif2c08.png", Codec::kPNG, &pool);
+  CodecInOut b_exif;
+  DecodeRoundtrip("external/pngsuite/exif2c08.png", Codec::kPNG, &pool, b_exif);
   EXPECT_EQ(978, b_exif.blobs.exif.size());
 }
 #endif
 
 void VerifyWideGamutMetadata(const std::string& relative_pathname,
                              const Primaries primaries, ThreadPool* pool) {
-  const CodecInOut io = DecodeRoundtrip(relative_pathname, pool);
+  CodecInOut io;
+  DecodeRoundtrip(relative_pathname, pool, io);
 
   EXPECT_EQ(8u, io.metadata.m.bit_depth.bits_per_sample);
   EXPECT_FALSE(io.metadata.m.bit_depth.floating_point_sample);
@@ -552,7 +557,7 @@ void VerifyWideGamutMetadata(const std::string& relative_pathname,
 }
 
 TEST(CodecTest, TestWideGamut) {
-  ThreadPoolInternal pool(12);
+  ThreadPoolForTests pool(12);
   // VerifyWideGamutMetadata("external/wide-gamut-tests/P3-sRGB-color-bars.png",
   //                        Primaries::kP3, &pool);
   VerifyWideGamutMetadata("external/wide-gamut-tests/P3-sRGB-color-ring.png",
@@ -606,11 +611,11 @@ TEST(CodecTest, EncodeToPNG) {
   std::unique_ptr<Encoder> png_encoder = Encoder::FromExtension(".png");
   ASSERT_THAT(png_encoder, NotNull());
 
-  const PaddedBytes original_png =
-      ReadTestData("external/wesaturate/500px/tmshre_riaphotographs_srgb8.png");
+  const PaddedBytes original_png = jxl::test::ReadTestData(
+      "external/wesaturate/500px/tmshre_riaphotographs_srgb8.png");
   PackedPixelFile ppf;
   ASSERT_TRUE(extras::DecodeBytes(Span<const uint8_t>(original_png),
-                                  ColorHints(), SizeConstraints(), &ppf));
+                                  ColorHints(), &ppf));
 
   const JxlPixelFormat& format = ppf.frames.front().color.format;
   ASSERT_THAT(
@@ -626,7 +631,7 @@ TEST(CodecTest, EncodeToPNG) {
   PackedPixelFile decoded_ppf;
   ASSERT_TRUE(
       extras::DecodeBytes(Span<const uint8_t>(encoded_png.bitstreams.front()),
-                          ColorHints(), SizeConstraints(), &decoded_ppf));
+                          ColorHints(), &decoded_ppf));
 
   ASSERT_EQ(decoded_ppf.info.bits_per_sample, ppf.info.bits_per_sample);
   ASSERT_EQ(decoded_ppf.frames.size(), 1);

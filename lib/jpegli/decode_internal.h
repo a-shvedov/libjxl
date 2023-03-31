@@ -71,6 +71,8 @@ struct jpeg_decomp_master {
 
   // Fields defined by SOF marker.
   size_t iMCU_cols_;
+  int h_factor[jpegli::kMaxComponents];
+  int v_factor[jpegli::kMaxComponents];
 
   // Initialized at strat of frame.
   uint16_t scan_progression_[jpegli::kMaxComponents][DCTSIZE2];
@@ -91,30 +93,54 @@ struct jpeg_decomp_master {
   //
   // Rendering state.
   //
+  int output_passes_done_ = 0;
   JpegliDataType output_data_type_ = JPEGLI_TYPE_UINT8;
   bool swap_endianness_ = false;
   size_t xoffset_ = 0;
 
-  JSAMPARRAY scanlines_;
-  JDIMENSION max_lines_;
-  size_t num_output_rows_;
+  int min_scaled_dct_size;
+  int scaled_dct_size[jpegli::kMaxComponents];
 
   std::array<size_t, jpegli::kMaxComponents> raw_height_;
   std::array<jpegli::RowBuffer<float>, jpegli::kMaxComponents> raw_output_;
   std::array<jpegli::RowBuffer<float>, jpegli::kMaxComponents> render_output_;
 
-  hwy::AlignedFreeUniquePtr<float[]> idct_scratch_;
-  hwy::AlignedFreeUniquePtr<float[]> upsample_scratch_;
-  hwy::AlignedFreeUniquePtr<uint8_t[]> output_scratch_;
-  hwy::AlignedFreeUniquePtr<float[]> dequant_;
+  void (*inverse_transform[jpegli::kMaxComponents])(
+      const int16_t* JXL_RESTRICT qblock, const float* JXL_RESTRICT dequant,
+      const float* JXL_RESTRICT biases, float* JXL_RESTRICT scratch_space,
+      float* JXL_RESTRICT output, size_t output_stride, size_t dctsize);
+
+  void (*color_transform)(float* row[jpegli::kMaxComponents], size_t len);
+
+  float* idct_scratch_;
+  float* upsample_scratch_;
+  uint8_t* output_scratch_;
+  float* dequant_;
+  // 1 = 1pass, 2 = 2pass, 3 = external
+  int quant_mode_;
+  int quant_pass_;
+  int num_colors_[jpegli::kMaxComponents];
+  uint8_t* colormap_lut_;
+  uint8_t* pixels_;
+  JSAMPARRAY scanlines_;
+  std::vector<std::vector<uint8_t>> candidate_lists_;
+  bool regenerate_inverse_colormap_;
+  float* dither_[jpegli::kMaxComponents];
+  float* error_row_[2 * jpegli::kMaxComponents];
+  size_t dither_size_;
+  size_t dither_mask_;
 
   // Per channel and per frequency statistics about the number of nonzeros and
   // the sum of coefficient absolute values, used in dequantization bias
   // computation.
-  hwy::AlignedFreeUniquePtr<int[]> nonzeros_;
-  hwy::AlignedFreeUniquePtr<int[]> sumabs_;
+  int* nonzeros_;
+  int* sumabs_;
   std::vector<size_t> num_processed_blocks_;
-  hwy::AlignedFreeUniquePtr<float[]> biases_;
+  float* biases_;
+#define SAVED_COEFS 10
+  // This holds the coef_bits of the scan before the current scan,
+  // i.e. the bottom half when rendering incomplete scans.
+  int (*coef_bits_latch)[SAVED_COEFS];
 };
 
 #endif  // LIB_JPEGLI_DECODE_INTERNAL_H_

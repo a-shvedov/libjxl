@@ -19,14 +19,13 @@ import sys
 import tempfile
 
 
-HEAD = """
-# Copyright (c) the JPEG XL Project Authors. All rights reserved.
+HEAD = """# Copyright (c) the JPEG XL Project Authors. All rights reserved.
 #
 # Use of this source code is governed by a BSD-style
 # license that can be found in the LICENSE file.
 
 # This file is generated, do not modify by manually.
-# Run `tools/build_cleaner.py --update` to regenerate it.
+# Run `tools/scripts/build_cleaner.py --update` to regenerate it.
 """
 
 
@@ -82,19 +81,24 @@ def SplitLibFiles(repo_files):
   # First pick files scattered across directories.
   tests, srcs = Filter(srcs, HasSuffixFn('_test.cc'))
   jpegli_tests, jpegli_srcs = Filter(jpegli_srcs, HasSuffixFn('_test.cc'))
+  # TODO(eustas): move to separate list?
+  _, srcs = Filter(srcs, ContainsFn('testing.h'))
+  _, jpegli_srcs = Filter(jpegli_srcs, ContainsFn('testing.h'))
   testlib_files, srcs = Filter(srcs, ContainsFn('test'))
   jpegli_testlib_files, jpegli_srcs = Filter(jpegli_srcs, ContainsFn('test'))
   gbench_sources, srcs = Filter(srcs, HasSuffixFn('_gbench.cc'))
 
   extras_sources, srcs = Filter(srcs, HasPrefixFn('extras/'))
   lib_srcs, srcs = Filter(srcs, HasPrefixFn('jxl/'))
-  profiler_sources, srcs = Filter(srcs, HasPrefixFn('profiler/'))
   public_headers, srcs = Filter(srcs, HasPrefixFn('include/jxl/'))
   threads_sources, srcs = Filter(srcs, HasPrefixFn('threads/'))
 
   Check(len(srcs) == 0, 'Orphan source files: ' + str(srcs))
 
-  jpegli_wrapper_sources, jpegli_srcs = Filter(jpegli_srcs, HasSuffixFn('libjpeg_wrapper.cc'))
+  base_sources, lib_srcs = Filter(lib_srcs, HasPrefixFn('jxl/base/'))
+
+  jpegli_wrapper_sources, jpegli_srcs = Filter(
+      jpegli_srcs, HasSuffixFn('libjpeg_wrapper.cc'))
   jpegli_sources = jpegli_srcs
 
   threads_public_headers, public_headers = Filter(
@@ -130,14 +134,16 @@ def SplitLibFiles(repo_files):
   # TODO(lode): further prune dec_srcs: only those files that the decoder
   # absolutely needs, and or not only for encoding, should be listed here.
 
-  return codecs | {'dec_box_sources': dec_box_sources,
-    'dec_jpeg_sources': dec_jpeg_sources, 'dec_sources': dec_sources,
-    'enc_sources': enc_sources,
+  return codecs | {'base_sources': base_sources, 
+    'dec_box_sources': dec_box_sources, 'dec_jpeg_sources': dec_jpeg_sources,
+    'dec_sources': dec_sources, 'enc_sources': enc_sources,
     'extras_for_tools_sources': extras_for_tools_sources,
     'extras_sources': extras_sources, 'gbench_sources': gbench_sources,
-    'jpegli_sources': jpegli_sources, 'jpegli_testlib_files': jpegli_testlib_files,
-    'jpegli_tests': jpegli_tests, 'jpegli_wrapper_sources' : jpegli_wrapper_sources,
-    'profiler_sources': profiler_sources, 'public_headers': public_headers,
+    'jpegli_sources': jpegli_sources,
+    'jpegli_testlib_files': jpegli_testlib_files,
+    'jpegli_tests': jpegli_tests,
+    'jpegli_wrapper_sources' : jpegli_wrapper_sources,
+    'public_headers': public_headers,
     'testlib_files': testlib_files, 'tests': tests,
     'threads_public_headers': threads_public_headers,
     'threads_sources': threads_sources,
@@ -211,7 +217,8 @@ def BuildCleaner(args):
   cmake_chunks = [HEAD]
   cmake_parts = lists
   for var in sorted(cmake_parts):
-    cmake_chunks.append(FormatCMakeVar('JPEGXL_INTERNAL_' + var.upper(), cmake_parts[var]))
+    cmake_chunks.append(FormatCMakeVar(
+        'JPEGXL_INTERNAL_' + var.upper(), cmake_parts[var]))
 
   gni_chunks = [HEAD]
   gni_parts = version | lists
@@ -220,7 +227,7 @@ def BuildCleaner(args):
 
   okay = [
     MaybeUpdateFile(args, 'lib/jxl_lists.cmake', '\n'.join(cmake_chunks)),
-    MaybeUpdateFile(args, 'lib/lib.gni', '\n'.join(gni_chunks)),
+    MaybeUpdateFile(args, 'lib/jxl_lists.bzl', '\n'.join(gni_chunks)),
   ]
   return all(okay)
 
@@ -228,7 +235,7 @@ def BuildCleaner(args):
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument('--src-dir',
-    default=os.path.realpath(os.path.join( os.path.dirname(__file__), '..')),
+    default=os.path.realpath(os.path.join( os.path.dirname(__file__), '../..')),
     help='path to the build directory')
   parser.add_argument('--update', default=False, action='store_true',
     help='update the build files instead of only checking')

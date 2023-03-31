@@ -11,6 +11,12 @@
 // also require a change to the range-check here. The advantage is
 // that this minimizes the size of libjxl.
 
+#include <jxl/codestream_header.h>
+#include <jxl/encode.h>
+#include <jxl/encode_cxx.h>
+#include <jxl/thread_parallel_runner.h>
+#include <jxl/thread_parallel_runner_cxx.h>
+#include <jxl/types.h>
 #include <stdint.h>
 
 #include <cmath>
@@ -23,12 +29,6 @@
 #include <type_traits>
 #include <vector>
 
-#include "jxl/codestream_header.h"
-#include "jxl/encode.h"
-#include "jxl/encode_cxx.h"
-#include "jxl/thread_parallel_runner.h"
-#include "jxl/thread_parallel_runner_cxx.h"
-#include "jxl/types.h"
 #include "lib/extras/dec/apng.h"
 #include "lib/extras/dec/color_hints.h"
 #include "lib/extras/dec/exr.h"
@@ -42,7 +42,6 @@
 #include "lib/jxl/base/printf_macros.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/exif.h"
-#include "lib/jxl/size_constraints.h"
 #include "tools/args.h"
 #include "tools/cmdline.h"
 #include "tools/codec_config.h"
@@ -320,7 +319,7 @@ struct CompressArgs {
         'x', "dec-hints", "key=value",
         "color_space indicates the ColorEncoding, see Description();\n"
         "icc_pathname refers to a binary file containing an ICC profile.",
-        &color_hints, &ParseAndAppendKeyValue, 1);
+        &color_hints, &ParseAndAppendKeyValue<jxl::extras::ColorHints>, 1);
 
     cmdline->AddOptionValue(
         '\0', "override_bitdepth", "0=use from image, 1-32=override",
@@ -375,9 +374,8 @@ struct CompressArgs {
         '\0', "modular_lossy_palette",
         "[modular encoding] quantize to a palette that has fewer entries than "
         "would be necessary for perfect preservation; for the time being, it "
-        "is "
-        "recommended to set --palette=0 with this option to use the default "
-        "palette only",
+        "is recommended to set --modular_palette_colors=0 with this option to "
+        "use the default palette only",
         &modular_lossy_palette, &SetBooleanTrue, 1);
 
     cmdline->AddOptionValue(
@@ -581,37 +579,30 @@ jxl::Status GetPixeldata(const std::vector<uint8_t>& image_data,
   jxl::Span<const uint8_t> encoded(image_data);
 
   ppf.info.orientation = JXL_ORIENT_IDENTITY;
-  jxl::SizeConstraints size_constraints;
 
   const auto choose_codec = [&]() {
 #if JPEGXL_ENABLE_APNG
-    if (jxl::extras::DecodeImageAPNG(encoded, color_hints, size_constraints,
-                                     &ppf)) {
+    if (jxl::extras::DecodeImageAPNG(encoded, color_hints, &ppf)) {
       return jxl::extras::Codec::kPNG;
     }
 #endif
-    if (jxl::extras::DecodeImagePGX(encoded, color_hints, size_constraints,
-                                    &ppf)) {
+    if (jxl::extras::DecodeImagePGX(encoded, color_hints, &ppf)) {
       return jxl::extras::Codec::kPGX;
-    } else if (jxl::extras::DecodeImagePNM(encoded, color_hints,
-                                           size_constraints, &ppf)) {
+    } else if (jxl::extras::DecodeImagePNM(encoded, color_hints, &ppf)) {
       return jxl::extras::Codec::kPNM;
     }
 #if JPEGXL_ENABLE_GIF
-    if (jxl::extras::DecodeImageGIF(encoded, color_hints, size_constraints,
-                                    &ppf)) {
+    if (jxl::extras::DecodeImageGIF(encoded, color_hints, &ppf)) {
       return jxl::extras::Codec::kGIF;
     }
 #endif
 #if JPEGXL_ENABLE_JPEG
-    if (jxl::extras::DecodeImageJPG(encoded, color_hints, size_constraints,
-                                    &ppf)) {
+    if (jxl::extras::DecodeImageJPG(encoded, color_hints, &ppf)) {
       return jxl::extras::Codec::kJPG;
     }
 #endif
 #if JPEGXL_ENABLE_EXR
-    if (jxl::extras::DecodeImageEXR(encoded, color_hints, size_constraints,
-                                    &ppf)) {
+    if (jxl::extras::DecodeImageEXR(encoded, color_hints, &ppf)) {
       return jxl::extras::Codec::kEXR;
     }
 #endif
@@ -663,7 +654,7 @@ void SetDistanceFromFlags(CommandLineParser* cmdline, CompressArgs* args,
   bool quality_set = cmdline->GetOption(args->opt_quality_id)->matched();
   if (((distance_set && (args->distance != 0.0)) ||
        (quality_set && (args->quality != 100))) &&
-      args->lossless_jpeg && args->lossless_jpeg) {
+      args->lossless_jpeg) {
     std::cerr << "Must not set quality below 100 nor non-zero distance in "
                  "combination with --lossless_jpeg=1."
               << std::endl;
@@ -912,7 +903,7 @@ void ProcessFlags(const jxl::extras::Codec codec,
 
   if (args->num_threads < -1) {
     std::cerr
-        << "Invalid flag value for --num_threads: must be -1, 0 or postive."
+        << "Invalid flag value for --num_threads: must be -1, 0 or positive."
         << std::endl;
     exit(EXIT_FAILURE);
   }

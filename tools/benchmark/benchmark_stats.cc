@@ -17,7 +17,8 @@
 #include "lib/jxl/base/status.h"
 #include "tools/benchmark/benchmark_args.h"
 
-namespace jxl {
+namespace jpegxl {
+namespace tools {
 namespace {
 
 // Computes longest codec name from Args()->codec, for table alignment.
@@ -61,7 +62,7 @@ struct ColumnDescriptor {
   bool more;  // Whether to print only if more_columns is enabled
 };
 
-static const ColumnDescriptor ExtraMetricDescriptor() {
+static ColumnDescriptor ExtraMetricDescriptor() {
   ColumnDescriptor d{{"DO NOT USE"}, 12, 4, TYPE_POSITIVE_FLOAT, false};
   return d;
 }
@@ -149,7 +150,7 @@ void BenchmarkStats::Assimilate(const BenchmarkStats& victim) {
   total_adj_compressed_size += victim.total_adj_compressed_size;
   total_time_encode += victim.total_time_encode;
   total_time_decode += victim.total_time_decode;
-  max_distance = std::max(max_distance, victim.max_distance);
+  max_distance += pow(victim.max_distance, 2.0) * victim.total_input_pixels;
   distance_p_norm += victim.distance_p_norm;
   ssimulacra2 += victim.ssimulacra2;
   distance_2 += victim.distance_2;
@@ -169,7 +170,7 @@ void BenchmarkStats::PrintMoreStats() const {
   if (Args()->print_more_stats) {
     jxl_stats.Print();
     size_t total_bits = jxl_stats.aux_out.TotalBits();
-    size_t compressed_bits = total_compressed_size * kBitsPerByte;
+    size_t compressed_bits = total_compressed_size * jxl::kBitsPerByte;
     if (total_bits != compressed_bits) {
       printf("Total layer bits: %" PRIuS " vs total compressed bits: %" PRIuS
              "  (%.2f%% accounted for)\n",
@@ -206,6 +207,8 @@ std::vector<ColumnValue> BenchmarkStats::ComputeColumns(
   const double ssimulacra2_avg = ssimulacra2 / total_input_pixels;
   const double bpp_p_norm = p_norm * comp_bpp;
 
+  const double max_distance_avg = sqrt(max_distance / total_input_pixels);
+
   std::vector<ColumnValue> values(
       GetColumnDescriptors(extra_metrics.size()).size());
 
@@ -215,7 +218,7 @@ std::vector<ColumnValue> BenchmarkStats::ComputeColumns(
   values[3].f = comp_bpp;
   values[4].f = compression_speed;
   values[5].f = decompression_speed;
-  values[6].f = static_cast<double>(max_distance);
+  values[6].f = static_cast<double>(max_distance_avg);
   values[7].f = ssimulacra2_avg;
   values[8].f = p_norm;
   values[9].f = psnr;
@@ -377,4 +380,5 @@ std::string PrintAggregate(
   return PrintFormattedEntries(num_extra_metrics, result);
 }
 
-}  // namespace jxl
+}  // namespace tools
+}  // namespace jpegxl

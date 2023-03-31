@@ -15,6 +15,7 @@
 #include <array>
 #include <vector>
 
+#include "lib/jpegli/bit_writer.h"
 #include "lib/jpegli/common_internal.h"
 #include "lib/jpegli/encode.h"
 
@@ -38,8 +39,9 @@ struct JPEGHuffmanCode {
 // DCTCodingState: maximum number of correction bits to buffer
 const int kJPEGMaxCorrectionBits = 1u << 16;
 
+static constexpr float kDCBias = 128.0f;
+
 constexpr int kDefaultProgressiveLevel = 2;
-constexpr float kDefaultQuantFieldMax = 0.575f;
 
 struct HuffmanCodeTable {
   int depth[256];
@@ -58,7 +60,9 @@ typedef int16_t coeff_t;
 }  // namespace jpegli
 
 struct jpeg_comp_master {
-  std::array<jpegli::RowBuffer<float>, jpegli::kMaxComponents> input_buffer;
+  jpegli::RowBuffer<float> input_buffer[jpegli::kMaxComponents];
+  jpegli::RowBuffer<float> downsampler_output[jpegli::kMaxComponents];
+  jpegli::RowBuffer<float>* raw_data[jpegli::kMaxComponents];
   float distance = 1.0;
   bool force_baseline = true;
   bool xyb_mode = false;
@@ -67,16 +71,38 @@ struct jpeg_comp_master {
   int progressive_level = jpegli::kDefaultProgressiveLevel;
   size_t xsize_blocks = 0;
   size_t ysize_blocks = 0;
+  size_t blocks_per_iMCU_row = 0;
   std::vector<jpegli::ScanCodingInfo> scan_coding_info;
   std::vector<std::vector<uint8_t>> special_markers;
   uint8_t* next_marker_byte = nullptr;
   JpegliDataType data_type = JPEGLI_TYPE_UINT8;
   JpegliEndianness endianness = JPEGLI_NATIVE_ENDIAN;
+  void (*input_method)(const uint8_t* row_in, size_t len,
+                       float* row_out[jpegli::kMaxComponents]);
+  void (*color_transform)(float* row[jpegli::kMaxComponents], size_t len);
+  void (*downsample_method[jpegli::kMaxComponents])(
+      float* rows_in[MAX_SAMP_FACTOR], size_t len, float* row_out);
+  float* quant_mul[jpegli::kMaxComponents];
+  float zero_bias_mul[jpegli::kMaxComponents];
+  int h_factor[jpegli::kMaxComponents];
+  int v_factor[jpegli::kMaxComponents];
+  std::vector<jpegli::JPEGHuffmanCode> huffman_codes;
+  jpegli::HuffmanCodeTable huff_tables[8];
   std::array<jpegli::HuffmanCodeTable, jpegli::kMaxHuffmanTables> dc_huff_table;
   std::array<jpegli::HuffmanCodeTable, jpegli::kMaxHuffmanTables> ac_huff_table;
+  float* diff_buffer;
+  jpegli::RowBuffer<float> fuzzy_erosion_tmp;
+  jpegli::RowBuffer<float> pre_erosion;
   jpegli::RowBuffer<float> quant_field;
-  float quant_field_max = jpegli::kDefaultQuantFieldMax;
   jvirt_barray_ptr* coeff_buffers = nullptr;
+  size_t next_input_row;
+  size_t next_iMCU_row;
+  size_t last_dht_index;
+  size_t last_restart_interval;
+  JCOEF last_dc_coeff[MAX_COMPS_IN_SCAN];
+  jpegli::JpegBitWriter bw;
+  float* dct_buffer;
+  int32_t* block_tmp;
 };
 
 #endif  // LIB_JPEGLI_ENCODE_INTERNAL_H_

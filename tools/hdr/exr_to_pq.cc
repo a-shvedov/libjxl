@@ -10,11 +10,11 @@
 #include "lib/extras/dec/decode.h"
 #include "lib/extras/packed_image_convert.h"
 #include "lib/jxl/base/file_io.h"
-#include "lib/jxl/base/thread_pool_internal.h"
 #include "lib/jxl/enc_color_management.h"
 #include "lib/jxl/image_bundle.h"
 #include "tools/cmdline.h"
-#include "tools/image_utils.h"
+#include "tools/hdr/image_utils.h"
+#include "tools/thread_pool_internal.h"
 
 namespace {
 
@@ -42,7 +42,7 @@ bool ParseLuminanceInfo(const char* argument, LuminanceInfo* luminance_info) {
 }  // namespace
 
 int main(int argc, const char** argv) {
-  jxl::ThreadPoolInternal pool;
+  jpegxl::tools::ThreadPoolInternal pool;
 
   jpegxl::tools::CommandLineParser parser;
   LuminanceInfo luminance_info;
@@ -81,8 +81,7 @@ int main(int argc, const char** argv) {
   std::vector<uint8_t> input_bytes;
   JXL_CHECK(jxl::ReadFile(input_filename, &input_bytes));
   JXL_CHECK(jxl::extras::DecodeBytes(jxl::Span<const uint8_t>(input_bytes),
-                                     jxl::extras::ColorHints(),
-                                     jxl::SizeConstraints(), &ppf));
+                                     jxl::extras::ColorHints(), &ppf));
 
   jxl::CodecInOut image;
   JXL_CHECK(
@@ -92,8 +91,8 @@ int main(int argc, const char** argv) {
   linear_rec_2020.primaries = jxl::Primaries::k2100;
   linear_rec_2020.tf.SetTransferFunction(jxl::TransferFunction::kLinear);
   JXL_CHECK(linear_rec_2020.CreateICC());
-  JXL_CHECK(jpegxl::tools::TransformCodecInOutTo(image, linear_rec_2020,
-                                                 jxl::GetJxlCms(), &pool));
+  JXL_CHECK(
+      jpegxl::tools::TransformCodecInOutTo(image, linear_rec_2020, &pool));
 
   float primaries_xyz[9];
   const jxl::PrimariesCIExy primaries = image.Main().c_current().GetPrimaries();
@@ -152,8 +151,7 @@ int main(int argc, const char** argv) {
   jxl::ColorEncoding pq = image.Main().c_current();
   pq.tf.SetTransferFunction(jxl::TransferFunction::kPQ);
   JXL_CHECK(pq.CreateICC());
-  JXL_CHECK(
-      jpegxl::tools::TransformCodecInOutTo(image, pq, jxl::GetJxlCms(), &pool));
+  JXL_CHECK(jpegxl::tools::TransformCodecInOutTo(image, pq, &pool));
   image.metadata.m.color_encoding = pq;
   JXL_CHECK(jxl::EncodeToFile(image, output_filename, &pool));
 }

@@ -12,71 +12,70 @@
 #include <hwy/foreach_target.h>
 #include <hwy/highway.h>
 
-#include "lib/jxl/enc_transforms.h"
+#include "lib/jpegli/dct-inl.h"
+#include "lib/jpegli/memory_manager.h"
+
 HWY_BEFORE_NAMESPACE();
 namespace jpegli {
 namespace HWY_NAMESPACE {
+namespace {
 
-constexpr float kZeroBiasMulXYB[] = {0.5f, 0.5f, 0.5f};
-constexpr float kZeroBiasMulYCbCr[] = {0.7f, 1.0f, 0.8f};
-
-void ComputeDCTCoefficients(
-    j_compress_ptr cinfo,
-    std::vector<std::vector<jpegli::coeff_t> >* all_coeffs) {
-  jpeg_comp_master* m = cinfo->master;
-  float qfmax = m->quant_field_max;
-  std::vector<float> zero_bias_mul(cinfo->num_components, 0.5f);
-  const bool xyb = m->xyb_mode && cinfo->jpeg_color_space == JCS_RGB;
-  if (m->distance <= 1.0f) {
-    for (int c = 0; c < 3 && c < cinfo->num_components; ++c) {
-      zero_bias_mul[c] = xyb ? kZeroBiasMulXYB[c] : kZeroBiasMulYCbCr[c];
-    }
+void ComputeCoefficientBlock(const float* JXL_RESTRICT pixels, size_t stride,
+                             const float* JXL_RESTRICT qmc, float aq_strength,
+                             float zero_bias_mul, float* JXL_RESTRICT tmp,
+                             JCOEF* block) {
+  float* JXL_RESTRICT dct = tmp;
+  float* JXL_RESTRICT scratch_space = tmp + DCTSIZE2;
+  TransformFromPixels(pixels, stride, dct, scratch_space);
+  if (aq_strength > 0.0f) {
+    // Create more zeros in areas where jpeg xl would have used a lower
+    // quantization multiplier.
+    float zero_bias = 0.5f + zero_bias_mul * aq_strength;
+    zero_bias = std::min(1.5f, zero_bias);
+    QuantizeBlock(dct, qmc, zero_bias, block);
+  } else {
+    QuantizeBlockNoAQ(dct, qmc, block);
   }
-  HWY_ALIGN float scratch_space[2 * kDCTBlockSize];
-  jxl::ImageF tmp;
+  // Center DC values around zero.
+  block[0] = std::round((dct[0] - kDCBias) * qmc[0]);
+}
+
+void ComputeDCTCoefficients(j_compress_ptr cinfo) {
+  jpeg_comp_master* m = cinfo->master;
+  float* tmp = m->dct_buffer;
   for (int c = 0; c < cinfo->num_components; c++) {
     jpeg_component_info* comp = &cinfo->comp_info[c];
-    const size_t xsize_blocks = comp->width_in_blocks;
-    const size_t ysize_blocks = comp->height_in_blocks;
-    JXL_DASSERT(cinfo->max_h_samp_factor % comp->h_samp_factor == 0);
-    JXL_DASSERT(cinfo->max_v_samp_factor % comp->v_samp_factor == 0);
-    const int h_factor = cinfo->max_h_samp_factor / comp->h_samp_factor;
-    const int v_factor = cinfo->max_v_samp_factor / comp->v_samp_factor;
-    std::vector<coeff_t> coeffs(xsize_blocks * ysize_blocks * kDCTBlockSize);
-    JQUANT_TBL* quant_table = cinfo->quant_tbl_ptrs[comp->quant_tbl_no];
-    std::vector<float> qmc(kDCTBlockSize);
-    for (size_t k = 0; k < kDCTBlockSize; k++) {
-      qmc[k] = 1.0f / quant_table->quantval[k];
-    }
-    RowBuffer<float>* plane = &m->input_buffer[c];
-    for (size_t by = 0, bix = 0; by < ysize_blocks; by++) {
-      for (size_t bx = 0; bx < xsize_blocks; bx++, bix++) {
-        coeff_t* block = &coeffs[bix * kDCTBlockSize];
-        HWY_ALIGN float dct[kDCTBlockSize];
-        TransformFromPixels(jxl::AcStrategy::Type::DCT,
-                            plane->Row(8 * by) + 8 * bx, plane->stride(), dct,
-                            scratch_space);
-        // Create more zeros in areas where jpeg xl would have used a lower
-        // quantization multiplier.
-        float relq = qfmax / m->quant_field.Row(by * v_factor)[bx * h_factor];
-        float zero_bias = 0.5f + zero_bias_mul[c] * (relq - 1.0f);
-        zero_bias = std::min(1.5f, zero_bias);
-        for (size_t iy = 0, i = 0; iy < 8; iy++) {
-          for (size_t ix = 0; ix < 8; ix++, i++) {
-            float coeff = 2040 * dct[ix * 8 + iy] * qmc[i];
-            int cc = std::abs(coeff) < zero_bias ? 0 : std::round(coeff);
-            block[i] = cc;
-          }
+    int by0 = m->next_iMCU_row * comp->v_samp_factor;
+    int block_rows_left = comp->height_in_blocks - by0;
+    int max_block_rows = std::min(comp->v_samp_factor, block_rows_left);
+    JBLOCKARRAY ba = (*cinfo->mem->access_virt_barray)(
+        reinterpret_cast<j_common_ptr>(cinfo), m->coeff_buffers[c], by0,
+        max_block_rows, true);
+    float* qmc = m->quant_mul[c];
+    RowBuffer<float>* plane = m->raw_data[c];
+    const int h_factor = m->h_factor[c];
+    const int v_factor = m->v_factor[c];
+    const float zero_bias_mul = m->zero_bias_mul[c];
+    float aq_strength = 0.0f;
+    for (int iy = 0; iy < comp->v_samp_factor; iy++) {
+      size_t by = by0 + iy;
+      if (by >= comp->height_in_blocks) continue;
+      JBLOCKROW brow = ba[iy];
+      const float* row = plane->Row(8 * by);
+      for (size_t bx = 0; bx < comp->width_in_blocks; bx++) {
+        JCOEF* block = &brow[bx][0];
+        if (m->use_adaptive_quantization) {
+          aq_strength = m->quant_field.Row(by * v_factor)[bx * h_factor];
         }
-        // Center DC values around zero.
-        block[0] = std::round((2040 * dct[0] - 1024) * qmc[0]);
+        ComputeCoefficientBlock(row + 8 * bx, plane->stride(), qmc, aq_strength,
+                                zero_bias_mul, tmp, block);
       }
     }
-    all_coeffs->emplace_back(std::move(coeffs));
   }
 }
 
 // NOLINTNEXTLINE(google-readability-namespace-comments)
+}  // namespace
 }  // namespace HWY_NAMESPACE
 }  // namespace jpegli
 HWY_AFTER_NAMESPACE();
@@ -84,11 +83,19 @@ HWY_AFTER_NAMESPACE();
 #if HWY_ONCE
 namespace jpegli {
 
+HWY_EXPORT(ComputeCoefficientBlock);
 HWY_EXPORT(ComputeDCTCoefficients);
 
-void ComputeDCTCoefficients(
-    j_compress_ptr cinfo, std::vector<std::vector<jpegli::coeff_t> >* coeffs) {
-  HWY_DYNAMIC_DISPATCH(ComputeDCTCoefficients)(cinfo, coeffs);
+void ComputeCoefficientBlock(const float* JXL_RESTRICT pixels, size_t stride,
+                             const float* JXL_RESTRICT qmc, float aq_strength,
+                             float zero_bias_mul, float* JXL_RESTRICT tmp,
+                             JCOEF* block) {
+  HWY_DYNAMIC_DISPATCH(ComputeCoefficientBlock)
+  (pixels, stride, qmc, aq_strength, zero_bias_mul, tmp, block);
+}
+
+void ComputeDCTCoefficients(j_compress_ptr cinfo) {
+  HWY_DYNAMIC_DISPATCH(ComputeDCTCoefficients)(cinfo);
 }
 
 }  // namespace jpegli

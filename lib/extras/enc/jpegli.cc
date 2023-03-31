@@ -5,10 +5,10 @@
 
 #include "lib/extras/enc/jpegli.h"
 
+#include <jxl/codestream_header.h>
 #include <setjmp.h>
 #include <stdint.h>
 
-#include "jxl/codestream_header.h"
 #include "lib/extras/enc/encode.h"
 #include "lib/jpegli/encode.h"
 #include "lib/jxl/enc_color_management.h"
@@ -38,7 +38,7 @@ Status VerifyInput(const PackedPixelFile& ppf) {
   const PackedImage& image = ppf.frames[0].color;
   JXL_RETURN_IF_ERROR(Encoder::VerifyImageSize(image, info));
   if (image.format.data_type == JXL_TYPE_FLOAT16) {
-    return JXL_FAILURE("FLOAT16 input is not supprted.");
+    return JXL_FAILURE("FLOAT16 input is not supported.");
   }
   JXL_RETURN_IF_ERROR(Encoder::VerifyBitDepth(image.format.data_type,
                                               info.bits_per_sample,
@@ -63,6 +63,44 @@ Status GetColorEncoding(const PackedPixelFile& ppf,
   }
   if (color_encoding->ICC().empty()) {
     return JXL_FAILURE("Invalid color encoding.");
+  }
+  return true;
+}
+
+bool HasICCProfile(const std::vector<uint8_t>& app_data) {
+  size_t pos = 0;
+  while (pos < app_data.size()) {
+    if (pos + 16 > app_data.size()) return false;
+    uint8_t marker = app_data[pos + 1];
+    size_t marker_len = (app_data[pos + 2] << 8) + app_data[pos + 3] + 2;
+    if (marker == 0xe2 && memcmp(&app_data[pos + 4], "ICC_PROFILE", 12) == 0) {
+      return true;
+    }
+    pos += marker_len;
+  }
+  return false;
+}
+
+Status WriteAppData(j_compress_ptr cinfo,
+                    const std::vector<uint8_t>& app_data) {
+  size_t pos = 0;
+  while (pos < app_data.size()) {
+    if (pos + 4 > app_data.size()) {
+      return JXL_FAILURE("Incomplete APP header.");
+    }
+    uint8_t marker = app_data[pos + 1];
+    size_t marker_len = (app_data[pos + 2] << 8) + app_data[pos + 3] + 2;
+    if (app_data[pos] != 0xff || marker < 0xe0 || marker > 0xef) {
+      return JXL_FAILURE("Invalid APP marker %02x %02x", app_data[pos], marker);
+    }
+    if (marker_len <= 4) {
+      return JXL_FAILURE("Invalid APP marker length.");
+    }
+    if (pos + marker_len > app_data.size()) {
+      return JXL_FAILURE("Incomplete APP data");
+    }
+    jpegli_write_marker(cinfo, marker, &app_data[pos + 4], marker_len - 4);
+    pos += marker_len;
   }
   return true;
 }
@@ -182,6 +220,9 @@ Status EncodeJpeg(const PackedPixelFile& ppf, const JpegSettings& jpeg_settings,
     if (ppf.info.num_color_channels != 3) {
       return JXL_FAILURE("Only RGB input is supported in XYB mode.");
     }
+    if (HasICCProfile(jpeg_settings.app_data)) {
+      return JXL_FAILURE("APP data ICC profile is not supported in XYB mode.");
+    }
     const ColorEncoding& c_desired = ColorEncoding::LinearSRGB(false);
     JXL_RETURN_IF_ERROR(
         c_transform.Init(color_encoding, c_desired, 255.0f, ppf.info.xsize, 1));
@@ -205,14 +246,13 @@ Status EncodeJpeg(const PackedPixelFile& ppf, const JpegSettings& jpeg_settings,
       hwy::AllocateAligned<float>(VectorSize() * 12);
   ComputePremulAbsorb(255.0f, premul_absorb.get());
 
+  jpeg_compress_struct cinfo;
   const auto try_catch_block = [&]() -> bool {
-    jpeg_compress_struct cinfo;
     jpeg_error_mgr jerr;
     jmp_buf env;
     cinfo.err = jpegli_std_error(&jerr);
     jerr.error_exit = &MyErrorExit;
     if (setjmp(env)) {
-      if (output_buffer) free(output_buffer);
       return false;
     }
     cinfo.client_data = static_cast<void*>(&env);
@@ -255,15 +295,30 @@ Status EncodeJpeg(const PackedPixelFile& ppf, const JpegSettings& jpeg_settings,
         &cinfo, jpeg_settings.use_adaptive_quantization);
     jpegli_set_distance(&cinfo, jpeg_settings.distance);
     jpegli_set_progressive_level(&cinfo, jpeg_settings.progressive_level);
+    cinfo.optimize_coding = jpeg_settings.optimize_coding;
+    if (!jpeg_settings.app_data.empty()) {
+      // Make sure jpegli_start_compress() does not write any APP markers.
+      cinfo.write_JFIF_header = false;
+      cinfo.write_Adobe_marker = false;
+    }
+    const PackedImage& image = ppf.frames[0].color;
+    if (jpeg_settings.xyb) {
+      jpegli_set_input_format(&cinfo, JPEGLI_TYPE_FLOAT, JPEGLI_NATIVE_ENDIAN);
+    } else {
+      jpegli_set_input_format(&cinfo, ConvertDataType(image.format.data_type),
+                              ConvertEndianness(image.format.endianness));
+    }
     jpegli_start_compress(&cinfo, TRUE);
-    if (!output_encoding.IsSRGB()) {
+    if (!jpeg_settings.app_data.empty()) {
+      JXL_RETURN_IF_ERROR(WriteAppData(&cinfo, jpeg_settings.app_data));
+    }
+    if ((jpeg_settings.app_data.empty() && !output_encoding.IsSRGB()) ||
+        jpeg_settings.xyb) {
       jpegli_write_icc_profile(&cinfo, output_encoding.ICC().data(),
                                output_encoding.ICC().size());
     }
-    const PackedImage& image = ppf.frames[0].color;
     const uint8_t* pixels = reinterpret_cast<const uint8_t*>(image.pixels());
     if (jpeg_settings.xyb) {
-      jpegli_set_input_format(&cinfo, JPEGLI_TYPE_FLOAT, JPEGLI_NATIVE_ENDIAN);
       float* src_buf = c_transform.BufSrc(0);
       float* dst_buf = c_transform.BufDst(0);
       for (size_t y = 0; y < image.ysize; ++y) {
@@ -299,8 +354,6 @@ Status EncodeJpeg(const PackedPixelFile& ppf, const JpegSettings& jpeg_settings,
         jpegli_write_scanlines(&cinfo, row, 1);
       }
     } else {
-      jpegli_set_input_format(&cinfo, ConvertDataType(image.format.data_type),
-                              ConvertEndianness(image.format.endianness));
       row_bytes.resize(image.stride);
       for (size_t y = 0; y < info.ysize; ++y) {
         memcpy(&row_bytes[0], pixels + y * image.stride, image.stride);
@@ -309,13 +362,14 @@ Status EncodeJpeg(const PackedPixelFile& ppf, const JpegSettings& jpeg_settings,
       }
     }
     jpegli_finish_compress(&cinfo);
-    jpegli_destroy_compress(&cinfo);
     compressed->resize(output_size);
     std::copy_n(output_buffer, output_size, compressed->data());
-    std::free(output_buffer);
     return true;
   };
-  return try_catch_block();
+  bool success = try_catch_block();
+  jpegli_destroy_compress(&cinfo);
+  if (output_buffer) free(output_buffer);
+  return success;
 }
 
 }  // namespace extras

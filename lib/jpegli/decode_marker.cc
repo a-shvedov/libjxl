@@ -18,7 +18,6 @@
 namespace jpegli {
 namespace {
 
-constexpr int kMaxSampling = 2;
 constexpr int kMaxDimPixels = 65535;
 constexpr uint8_t kIccProfileTag[12] = "ICC_PROFILE";
 
@@ -75,8 +74,8 @@ void ProcessSOF(j_decompress_ptr cinfo, const uint8_t* data, size_t len) {
   JPEG_VERIFY_INPUT(cinfo->image_width, 1, kMaxDimPixels);
   JPEG_VERIFY_INPUT(cinfo->num_components, 1, kMaxComponents);
   JPEG_VERIFY_LEN(3 * cinfo->num_components);
-  cinfo->comp_info =
-      jpegli::Allocate<jpeg_component_info>(cinfo, cinfo->num_components);
+  cinfo->comp_info = jpegli::Allocate<jpeg_component_info>(
+      cinfo, cinfo->num_components, JPOOL_IMAGE);
   m->components_.resize(cinfo->num_components);
 
   // Read sampling factors and quant table index for each component.
@@ -95,8 +94,8 @@ void ProcessSOF(j_decompress_ptr cinfo, const uint8_t* data, size_t len) {
     int factor = ReadUint8(data, &pos);
     int h_samp_factor = factor >> 4;
     int v_samp_factor = factor & 0xf;
-    JPEG_VERIFY_INPUT(h_samp_factor, 1, kMaxSampling);
-    JPEG_VERIFY_INPUT(v_samp_factor, 1, kMaxSampling);
+    JPEG_VERIFY_INPUT(h_samp_factor, 1, MAX_SAMP_FACTOR);
+    JPEG_VERIFY_INPUT(v_samp_factor, 1, MAX_SAMP_FACTOR);
     comp->h_samp_factor = h_samp_factor;
     comp->v_samp_factor = v_samp_factor;
     cinfo->max_h_samp_factor =
@@ -104,6 +103,7 @@ void ProcessSOF(j_decompress_ptr cinfo, const uint8_t* data, size_t len) {
     cinfo->max_v_samp_factor =
         std::max(cinfo->max_v_samp_factor, v_samp_factor);
     uint8_t quant_tbl_idx = ReadUint8(data, &pos);
+    comp->quant_tbl_no = quant_tbl_idx;
     comp->quant_table = cinfo->quant_tbl_ptrs[quant_tbl_idx];
     if (comp->quant_table == nullptr) {
       JPEGLI_ERROR("Quantization table with index %u not found", quant_tbl_idx);
@@ -156,8 +156,12 @@ void ProcessSOF(j_decompress_ptr cinfo, const uint8_t* data, size_t len) {
         cinfo->max_v_samp_factor % comp->v_samp_factor != 0) {
       JPEGLI_ERROR("Non-integral subsampling ratios.");
     }
-    comp->width_in_blocks = m->iMCU_cols_ * comp->h_samp_factor;
-    comp->height_in_blocks = cinfo->total_iMCU_rows * comp->v_samp_factor;
+    m->h_factor[i] = cinfo->max_h_samp_factor / comp->h_samp_factor;
+    m->v_factor[i] = cinfo->max_v_samp_factor / comp->v_samp_factor;
+    comp->downsampled_width = DivCeil(cinfo->image_width, m->h_factor[i]);
+    comp->downsampled_height = DivCeil(cinfo->image_height, m->v_factor[i]);
+    comp->width_in_blocks = DivCeil(comp->downsampled_width, DCTSIZE);
+    comp->height_in_blocks = DivCeil(comp->downsampled_height, DCTSIZE);
     const uint64_t num_blocks =
         static_cast<uint64_t>(comp->width_in_blocks) * comp->height_in_blocks;
     c->coeffs = hwy::AllocateAligned<coeff_t>(num_blocks * DCTSIZE2);
@@ -241,6 +245,22 @@ void ProcessSOS(j_decompress_ptr cinfo, const uint8_t* data, size_t len) {
   const uint16_t scan_bitmask =
       cinfo->Ah == 0 ? (0xffff << cinfo->Al) : (1u << cinfo->Al);
   const uint16_t refinement_bitmask = (1 << cinfo->Al) - 1;
+  if (!cinfo->coef_bits) {
+    cinfo->coef_bits =
+        Allocate<int[DCTSIZE2]>(cinfo, cinfo->num_components, JPOOL_IMAGE);
+    m->coef_bits_latch =
+        Allocate<int[SAVED_COEFS]>(cinfo, cinfo->num_components, JPOOL_IMAGE);
+
+    for (int c = 0; c < cinfo->num_components; ++c) {
+      for (int i = 0; i < DCTSIZE2; ++i) {
+        cinfo->coef_bits[c][i] = -1;
+        if (i < SAVED_COEFS) {
+          m->coef_bits_latch[c][i] = -1;
+        }
+      }
+    }
+  }
+
   for (int i = 0; i < cinfo->comps_in_scan; ++i) {
     int comp_idx = cinfo->cur_comp_info[i]->component_index;
     for (int k = cinfo->Ss; k <= cinfo->Se; ++k) {
@@ -256,6 +276,10 @@ void ProcessSOS(j_decompress_ptr cinfo, const uint8_t* data, size_t len) {
             comp_idx, k, m->scan_progression_[i][k], scan_bitmask);
       }
       m->scan_progression_[comp_idx][k] |= scan_bitmask;
+      if (k < SAVED_COEFS) {
+        m->coef_bits_latch[comp_idx][k] = cinfo->coef_bits[comp_idx][k];
+      }
+      cinfo->coef_bits[comp_idx][k] = cinfo->Al;
     }
   }
   if (cinfo->Al > 10) {
@@ -353,7 +377,11 @@ void ProcessDHT(j_decompress_ptr cinfo, const uint8_t* data, size_t len) {
     if (is_ac_table) {
       JPEG_VERIFY_INPUT(total_count, 0, kJpegHuffmanAlphabetSize);
     } else {
-      JPEG_VERIFY_INPUT(total_count, 0, kJpegDCAlphabetSize);
+      // Allow symbols up to 15 here, we check later whether any invalid symbols
+      // are actually decoded.
+      // TODO(szabadka) Make sure decoder works (does not crash) with up to
+      // 15-nbits DC symbols and then increase kJpegDCAlphabetSize.
+      JPEG_VERIFY_INPUT(total_count, 0, 16);
     }
     JPEG_VERIFY_LEN(total_count);
     // Symbol values sorted by increasing bit lengths.
@@ -362,7 +390,7 @@ void ProcessDHT(j_decompress_ptr cinfo, const uint8_t* data, size_t len) {
     for (int i = 0; i < total_count; ++i) {
       int value = ReadUint8(data, &pos);
       if (!is_ac_table) {
-        JPEG_VERIFY_INPUT(value, 0, kJpegDCAlphabetSize - 1);
+        JPEG_VERIFY_INPUT(value, 0, 15);
       }
       if (values_seen[value]) {
         return JPEGLI_ERROR("Duplicate Huffman code value %d", value);
@@ -519,12 +547,14 @@ void SaveMarker(j_decompress_ptr cinfo, const uint8_t* data, size_t len) {
 
   // Insert new saved marker to the head of the list.
   jpeg_saved_marker_ptr next = cinfo->marker_list;
-  cinfo->marker_list = jpegli::Allocate<jpeg_marker_struct>(cinfo, 1);
+  cinfo->marker_list =
+      jpegli::Allocate<jpeg_marker_struct>(cinfo, 1, JPOOL_IMAGE);
   cinfo->marker_list->next = next;
   cinfo->marker_list->marker = marker;
   cinfo->marker_list->original_length = payload_size;
   cinfo->marker_list->data_length = payload_size;
-  cinfo->marker_list->data = jpegli::Allocate<uint8_t>(cinfo, payload_size);
+  cinfo->marker_list->data =
+      jpegli::Allocate<uint8_t>(cinfo, payload_size, JPOOL_IMAGE);
   memcpy(cinfo->marker_list->data, payload, payload_size);
 }
 
@@ -553,6 +583,7 @@ uint8_t ProcessNextMarker(j_decompress_ptr cinfo) {
     AdvanceInput(cinfo, num_skipped);
   }
   uint8_t marker = data[pos + 1];
+  cinfo->unread_marker = marker;
   if (!m->found_soi_ && (num_skipped > 0 || marker != 0xd8)) {
     JPEGLI_ERROR("Did not find SOI marker.");
   }
@@ -596,6 +627,7 @@ uint8_t ProcessNextMarker(j_decompress_ptr cinfo) {
   }
   pos += marker_len;
   AdvanceInput(cinfo, marker_len);
+  cinfo->unread_marker = 0;
   return marker;
 }
 

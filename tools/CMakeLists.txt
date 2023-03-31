@@ -66,12 +66,12 @@ add_library(jxl_tool STATIC EXCLUDE_FROM_ALL
   codec_config.cc
   speed_stats.cc
   file_io.cc
-  image_utils.cc
   tool_version.cc
 )
 target_compile_options(jxl_tool PUBLIC "${JPEGXL_INTERNAL_FLAGS}")
 target_include_directories(jxl_tool PUBLIC "${PROJECT_SOURCE_DIR}")
-target_link_libraries(jxl_tool jxl-static hwy)
+target_link_libraries(jxl_tool PUBLIC hwy)
+jxl_link_libraries(jxl_tool jxl_base-obj)
 
 # The JPEGXL_VERSION is set from the builders.
 if(NOT DEFINED JPEGXL_VERSION OR JPEGXL_VERSION STREQUAL "")
@@ -345,6 +345,7 @@ foreach(FUZZER IN LISTS FUZZER_BINARIES)
   else()
     target_link_libraries("${BINARY}"
       jxl_extras-static
+      jxl_testlib-static
       jxl_tool
     )
   endif()
@@ -457,7 +458,7 @@ find_program (BASH_PROGRAM bash)
 if(BASH_PROGRAM AND $<TARGET_EXISTS:cjxl> AND $<TARGET_EXISTS:djxl> AND $<TARGET_EXISTS:ssimulacra_main>)
   add_test(
     NAME roundtrip_test
-    COMMAND ${BASH_PROGRAM} ${CMAKE_CURRENT_SOURCE_DIR}/roundtrip_test.sh
+    COMMAND ${BASH_PROGRAM} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/roundtrip_test.sh
             ${CMAKE_BINARY_DIR})
   if (CMAKE_CROSSCOMPILING_EMULATOR)
     set_tests_properties(roundtrip_test PROPERTIES ENVIRONMENT "EMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR}")

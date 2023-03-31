@@ -3,11 +3,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+#include <jxl/decode.h>
 #include <stdint.h>
 
-#include "jxl/decode.h"
-
-namespace jxl {
+namespace jpegxl {
+namespace tools {
 
 int TestOneInput(const uint8_t* data, size_t size) {
   JxlDecoderStatus status;
@@ -51,8 +51,9 @@ int TestOneInput(const uint8_t* data, size_t size) {
   return 0;
 }
 
-}  // namespace jxl
+}  // namespace tools
+}  // namespace jpegxl
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-  return jxl::TestOneInput(data, size);
+  return jpegxl::tools::TestOneInput(data, size);
 }

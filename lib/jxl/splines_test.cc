@@ -13,7 +13,7 @@
 #include "lib/jxl/enc_splines.h"
 #include "lib/jxl/image_test_utils.h"
 #include "lib/jxl/test_utils.h"
-#include "lib/jxl/testdata.h"
+#include "lib/jxl/testing.h"
 
 namespace jxl {
 
@@ -277,7 +277,7 @@ TEST(SplinesTest, DuplicatePoints) {
 
 TEST(SplinesTest, Drawing) {
   CodecInOut io_expected;
-  const PaddedBytes orig = ReadTestData("jxl/splines.pfm");
+  const PaddedBytes orig = jxl::test::ReadTestData("jxl/splines.pfm");
   ASSERT_TRUE(SetFromBytes(Span<const uint8_t>(orig), &io_expected,
                            /*pool=*/nullptr));
 
@@ -315,21 +315,21 @@ TEST(SplinesTest, Drawing) {
   ASSERT_TRUE(io_actual.frames[0].TransformTo(io_expected.Main().c_current(),
                                               GetJxlCms()));
 
-  VerifyRelativeError(*io_expected.Main().color(), *io_actual.Main().color(),
-                      1e-2f, 1e-1f);
+  JXL_ASSERT_OK(VerifyRelativeError(
+      *io_expected.Main().color(), *io_actual.Main().color(), 1e-2f, 1e-1f, _));
 }
 
 TEST(SplinesTest, ClearedEveryFrame) {
   CodecInOut io_expected;
   const PaddedBytes bytes_expected =
-      ReadTestData("jxl/spline_on_first_frame.png");
+      jxl::test::ReadTestData("jxl/spline_on_first_frame.png");
   ASSERT_TRUE(SetFromBytes(Span<const uint8_t>(bytes_expected), &io_expected,
                            /*pool=*/nullptr));
   CodecInOut io_actual;
   const PaddedBytes bytes_actual =
-      ReadTestData("jxl/spline_on_first_frame.jxl");
-  ASSERT_TRUE(test::DecodeFile({}, bytes_actual, &io_actual,
-                               /*pool=*/nullptr));
+      jxl::test::ReadTestData("jxl/spline_on_first_frame.jxl");
+  ASSERT_TRUE(
+      test::DecodeFile({}, Span<const uint8_t>(bytes_actual), &io_actual));
 
   ASSERT_TRUE(
       io_actual.frames[0].TransformTo(ColorEncoding::SRGB(), GetJxlCms()));
@@ -341,8 +341,8 @@ TEST(SplinesTest, ClearedEveryFrame) {
       }
     }
   }
-  VerifyRelativeError(*io_expected.Main().color(), *io_actual.Main().color(),
-                      1e-2f, 1e-1f);
+  JXL_ASSERT_OK(VerifyRelativeError(
+      *io_expected.Main().color(), *io_actual.Main().color(), 1e-2f, 1e-1f, _));
 }
 
 }  // namespace jxl

@@ -17,8 +17,12 @@
 
 namespace jpegli {
 
-void ComputeDCTCoefficients(j_compress_ptr cinfo,
-                            std::vector<std::vector<jpegli::coeff_t> >* coeffs);
+void ComputeCoefficientBlock(const float* JXL_RESTRICT pixels, size_t stride,
+                             const float* JXL_RESTRICT qmc, float aq_strength,
+                             float zero_bias_mul, float* JXL_RESTRICT tmp,
+                             JCOEF* block);
+
+void ComputeDCTCoefficients(j_compress_ptr cinfo);
 
 }  // namespace jpegli
 

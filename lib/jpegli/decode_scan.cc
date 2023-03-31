@@ -7,6 +7,8 @@
 
 #include <string.h>
 
+#include <hwy/base.h>
+
 #include "lib/jpegli/decode_internal.h"
 #include "lib/jpegli/error.h"
 #include "lib/jpegli/source_manager.h"
@@ -76,7 +78,7 @@ struct BitReaderState {
   // Sets *pos to the next stream position, and *bit_pos to the bit position
   // within the next byte where parsing should continue.
   // Returns false if the stream ended too early.
-  bool FinishStream(size_t* pos, size_t* bit_pos) {
+  bool FinishStream(j_decompress_ptr cinfo, size_t* pos, size_t* bit_pos) {
     *bit_pos = (8 - (bits_left_ & 7)) & 7;
     // Give back some bytes that we did not use.
     int unused_bytes_left = DivCeil(bits_left_, 8);
@@ -84,7 +86,7 @@ struct BitReaderState {
       --pos_;
       // If we give back a 0 byte, we need to check if it was a 0xff/0x00 escape
       // sequence, and if yes, we need to give back one more byte.
-      if (((pos_ == len_) ||
+      if (((pos_ == len_ && pos_ == next_marker_pos_) ||
            (pos_ > 0 && pos_ < next_marker_pos_ && data_[pos_] == 0)) &&
           (data_[pos_ - 1] == 0xff)) {
         --pos_;
@@ -96,6 +98,9 @@ struct BitReaderState {
       return false;
     }
     *pos = pos_;
+    if (*pos == next_marker_pos_ && *pos + 1 < len_) {
+      cinfo->unread_marker = data_[*pos + 1];
+    }
     return true;
   }
 
@@ -344,11 +349,16 @@ void SaveMCUCodingState(j_decompress_ptr cinfo) {
   for (int i = 0; i < cinfo->comps_in_scan; ++i) {
     const jpeg_component_info* comp = cinfo->cur_comp_info[i];
     DecJPEGComponent* c = &m->components_[comp->component_index];
-    int block_x = m->scan_mcu_col_ * comp->MCU_width;
+    size_t block_x = m->scan_mcu_col_ * comp->MCU_width;
     for (int iy = 0; iy < comp->MCU_height; ++iy) {
-      int block_y = m->scan_mcu_row_ * comp->MCU_height + iy;
-      size_t ncoeffs = comp->MCU_width * DCTSIZE2;
-      int block_idx = (block_y * comp->width_in_blocks + block_x) * DCTSIZE2;
+      size_t block_y = m->scan_mcu_row_ * comp->MCU_height + iy;
+      if (block_y >= comp->height_in_blocks) {
+        continue;
+      }
+      size_t nblocks =
+          std::min<size_t>(comp->MCU_width, comp->width_in_blocks - block_x);
+      size_t ncoeffs = nblocks * DCTSIZE2;
+      size_t block_idx = (block_y * comp->width_in_blocks + block_x) * DCTSIZE2;
       coeff_t* coeffs = &c->coeffs[block_idx];
       memcpy(&m->mcu_.coeffs[offset], coeffs, ncoeffs * sizeof(coeffs[0]));
       offset += ncoeffs;
@@ -364,16 +374,46 @@ void RestoreMCUCodingState(j_decompress_ptr cinfo) {
   for (int i = 0; i < cinfo->comps_in_scan; ++i) {
     const jpeg_component_info* comp = cinfo->cur_comp_info[i];
     DecJPEGComponent* c = &m->components_[comp->component_index];
-    int block_x = m->scan_mcu_col_ * comp->MCU_width;
+    size_t block_x = m->scan_mcu_col_ * comp->MCU_width;
     for (int iy = 0; iy < comp->MCU_height; ++iy) {
-      int block_y = m->scan_mcu_row_ * comp->MCU_height + iy;
-      size_t ncoeffs = comp->MCU_width * DCTSIZE2;
-      int block_idx = (block_y * comp->width_in_blocks + block_x) * DCTSIZE2;
+      size_t block_y = m->scan_mcu_row_ * comp->MCU_height + iy;
+      if (block_y >= comp->height_in_blocks) {
+        continue;
+      }
+      size_t nblocks =
+          std::min<size_t>(comp->MCU_width, comp->width_in_blocks - block_x);
+      size_t ncoeffs = nblocks * DCTSIZE2;
+      size_t block_idx = (block_y * comp->width_in_blocks + block_x) * DCTSIZE2;
       coeff_t* coeffs = &c->coeffs[block_idx];
       memcpy(coeffs, &m->mcu_.coeffs[offset], ncoeffs * sizeof(coeffs[0]));
       offset += ncoeffs;
     }
   }
+}
+
+bool FinishScan(j_decompress_ptr cinfo, const uint8_t* data, const size_t len,
+                size_t* pos) {
+  jpeg_decomp_master* m = cinfo->master;
+  if (m->eobrun_ > 0) {
+    JPEGLI_ERROR("End-of-block run too long.");
+  }
+  if (m->codestream_bits_ahead_ == 0) {
+    return true;
+  }
+  if (data[*pos] == 0xff) {
+    // After last br.FinishStream we checked that there is at least 2 bytes
+    // in the buffer.
+    JXL_DASSERT(*pos + 1 < len);
+    // br.FinishStream would have detected an early marker.
+    JXL_DASSERT(data[*pos + 1] == 0);
+    *pos += 2;
+    AdvanceInput(cinfo, 2);
+  } else {
+    *pos += 1;
+    AdvanceInput(cinfo, 1);
+  }
+  m->codestream_bits_ahead_ = 0;
+  return true;
 }
 
 }  // namespace
@@ -389,13 +429,8 @@ int ProcessScan(j_decompress_ptr cinfo) {
   for (;;) {
     // Handle the restart intervals.
     if (cinfo->restart_interval > 0 && m->restarts_to_go_ == 0) {
-      if (m->eobrun_ > 0) {
-        JPEGLI_ERROR("End-of-block run too long.");
-      }
-      if (m->codestream_bits_ahead_ > 0) {
-        ++pos;
-        AdvanceInput(cinfo, 1);
-        m->codestream_bits_ahead_ = 0;
+      if (!FinishScan(cinfo, data, len, &pos)) {
+        return JPEG_SUSPENDED;
       }
       if (pos + 2 > len) {
         return JPEG_SUSPENDED;
@@ -403,8 +438,7 @@ int ProcessScan(j_decompress_ptr cinfo) {
       int expected_marker = 0xd0 + m->next_restart_marker_;
       int marker = data[pos + 1];
       if (marker != expected_marker) {
-        JPEGLI_ERROR("Did not find expected restart marker %d actual %d",
-                     expected_marker, marker);
+        JPEGLI_ERROR("RST marker mismatch: %x vs %x", marker, expected_marker);
         // TODO(szabadka) Use source manager's resync_to_restart callback here.
       }
       m->next_restart_marker_ += 1;
@@ -426,6 +460,7 @@ int ProcessScan(j_decompress_ptr cinfo) {
     }
 
     // Decode one MCU.
+    HWY_ALIGN_MAX coeff_t dummy_block[DCTSIZE2];
     bool scan_ok = true;
     for (int i = 0; i < cinfo->comps_in_scan; ++i) {
       const jpeg_component_info* comp = cinfo->cur_comp_info[i];
@@ -435,11 +470,19 @@ int ProcessScan(j_decompress_ptr cinfo) {
       const HuffmanTableEntry* ac_lut =
           &m->ac_huff_lut_[comp->ac_tbl_no * kJpegHuffmanLutSize];
       for (int iy = 0; iy < comp->MCU_height; ++iy) {
-        int block_y = m->scan_mcu_row_ * comp->MCU_height + iy;
+        size_t block_y = m->scan_mcu_row_ * comp->MCU_height + iy;
         for (int ix = 0; ix < comp->MCU_width; ++ix) {
-          int block_x = m->scan_mcu_col_ * comp->MCU_width + ix;
-          int block_idx = block_y * comp->width_in_blocks + block_x;
+          size_t block_x = m->scan_mcu_col_ * comp->MCU_width + ix;
+          size_t block_idx = block_y * comp->width_in_blocks + block_x;
           coeff_t* coeffs = &c->coeffs[block_idx * DCTSIZE2];
+          if (block_x >= comp->width_in_blocks ||
+              block_y >= comp->height_in_blocks) {
+            // Note that it is OK that dummy_block is uninitialized because
+            // it will never be used in any branches, even in the RefineDCTBlock
+            // case, because only DC scans can be interleaved and we don't use
+            // the zero-ness of the DC coeff in the DC refinement code-path.
+            coeffs = dummy_block;
+          }
           if (cinfo->Ah == 0) {
             if (!DecodeDCTBlock(dc_lut, ac_lut, cinfo->Ss, cinfo->Se, cinfo->Al,
                                 &m->eobrun_, &br,
@@ -458,7 +501,7 @@ int ProcessScan(j_decompress_ptr cinfo) {
     }
     size_t bit_pos;
     size_t stream_pos;
-    bool stream_ok = br.FinishStream(&stream_pos, &bit_pos);
+    bool stream_ok = br.FinishStream(cinfo, &stream_pos, &bit_pos);
     if (stream_pos + 2 > len) {
       // If reading stopped within the last two bytes, we have to request more
       // input even if FinishStream() returned true, since the Huffman code
@@ -488,14 +531,8 @@ int ProcessScan(j_decompress_ptr cinfo) {
       ++m->scan_mcu_row_;
       m->scan_mcu_col_ = 0;
       if (m->scan_mcu_row_ == cinfo->MCU_rows_in_scan) {
-        // Current scan is done, skip any remaining bits in the last byte.
-        if (m->codestream_bits_ahead_ > 0) {
-          ++pos;
-          AdvanceInput(cinfo, 1);
-          m->codestream_bits_ahead_ = 0;
-        }
-        if (m->eobrun_ > 0) {
-          JPEGLI_ERROR("End-of-block run too long.");
+        if (!FinishScan(cinfo, data, len, &pos)) {
+          return JPEG_SUSPENDED;
         }
         break;
       } else if ((m->scan_mcu_row_ % m->mcu_rows_per_iMCU_row_) == 0) {

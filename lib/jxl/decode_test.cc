@@ -3,8 +3,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "jxl/decode.h"
-
+#include <jxl/decode.h>
+#include <jxl/decode_cxx.h>
+#include <jxl/resizable_parallel_runner_cxx.h>
+#include <jxl/thread_parallel_runner_cxx.h>
+#include <jxl/types.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -13,11 +16,6 @@
 #include <utility>
 #include <vector>
 
-#include "gtest/gtest.h"
-#include "jxl/decode_cxx.h"
-#include "jxl/resizable_parallel_runner_cxx.h"
-#include "jxl/thread_parallel_runner_cxx.h"
-#include "jxl/types.h"
 #include "lib/extras/codec.h"
 #include "lib/extras/dec/color_description.h"
 #include "lib/jxl/base/byte_order.h"
@@ -42,8 +40,9 @@
 #include "lib/jxl/icc_codec.h"
 #include "lib/jxl/image_metadata.h"
 #include "lib/jxl/jpeg/enc_jpeg_data.h"
+#include "lib/jxl/test_image.h"
 #include "lib/jxl/test_utils.h"
-#include "lib/jxl/testdata.h"
+#include "lib/jxl/testing.h"
 #include "lib/jxl/toc.h"
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -441,9 +440,9 @@ PaddedBytes CreateTestJXLCodestream(Span<const uint8_t> pixels, size_t xsize,
 }
 
 JxlDecoderStatus ProcessInputIgnoreBoxes(JxlDecoder* dec) {
-  JxlDecoderStatus status;
-  while ((status = JxlDecoderProcessInput(dec)) == JXL_DEC_BOX) {
-    continue;
+  JxlDecoderStatus status = JXL_DEC_BOX;
+  while (status == JXL_DEC_BOX) {
+    status = JxlDecoderProcessInput(dec);
   }
   return status;
 }
@@ -1617,7 +1616,7 @@ TEST(DecodeTest, PixelTestWithICCProfileLossless) {
       std::vector<uint8_t> pixels2 = jxl::DecodeWithAPI(
           dec, jxl::Span<const uint8_t>(compressed.data(), compressed.size()),
           format, /*use_callback=*/false, /*set_buffer_early=*/false,
-          /*use_resizable_runner=*/false, /*reuqire_boxes=*/false,
+          /*use_resizable_runner=*/false, /*require_boxes=*/false,
           /*expect_success=*/true);
       JxlDecoderReset(dec);
       EXPECT_EQ(num_pixels * channels * 4, pixels2.size());
@@ -1678,7 +1677,7 @@ TEST(DecodeTest, PixelTestWithICCProfileLossy) {
   jxl::ButteraugliParams ba;
   EXPECT_THAT(ButteraugliDistance(io0.frames, io1.frames, ba, jxl::GetJxlCms(),
                                   /*distmap=*/nullptr, nullptr),
-              IsSlightlyBelow(0.86f));
+              IsSlightlyBelow(0.75f));
 
   JxlDecoderDestroy(dec);
 }
@@ -1936,7 +1935,7 @@ TEST(DecodeTest, PixelTestOpaqueSrgbLossy) {
     EXPECT_THAT(
         ButteraugliDistance(io0.frames, io1.frames, ba, jxl::GetJxlCms(),
                             /*distmap=*/nullptr, nullptr),
-        IsSlightlyBelow(0.8f));
+        IsSlightlyBelow(0.85f));
 
     JxlDecoderDestroy(dec);
   }
@@ -1987,7 +1986,7 @@ TEST(DecodeTest, PixelTestOpaqueSrgbLossyNoise) {
     EXPECT_THAT(
         ButteraugliDistance(io0.frames, io1.frames, ba, jxl::GetJxlCms(),
                             /*distmap=*/nullptr, nullptr),
-        IsSlightlyBelow(2.4f));
+        IsSlightlyBelow(1.55f));
 
     JxlDecoderDestroy(dec);
   }
@@ -2042,7 +2041,7 @@ TEST(DecodeTest, ExtraBytesAfterCompressedStream) {
     } else if (box_format == kCSBF_Multi_Other_Terminated) {
       last_unknown_box_size = unk3_box_size + 8;
     } else if (box_format == kCSBF_Multi_Last_Empty_Other) {
-      // If boxes are not required, the decoder wont consume the last empty
+      // If boxes are not required, the decoder won't consume the last empty
       // jxlp box.
       last_unknown_box_size = 12 + unk3_box_size + 8;
     }
@@ -2442,7 +2441,7 @@ TEST(DecodeTest, AlignTest) {
         jxl::Span<const uint8_t>(compressed.data(), compressed.size()), format,
         use_callback, /*set_buffer_early=*/false,
         /*use_resizable_runner=*/false, /*require_boxes=*/false,
-        /*expect_succes=*/true);
+        /*expect_success=*/true);
     EXPECT_EQ(expected_line_bytes * ysize, pixels2.size());
     EXPECT_EQ(0u, jxl::test::ComparePixels(pixels.data(), pixels2.data(), xsize,
                                            ysize, format_orig, format));
@@ -4827,7 +4826,7 @@ TEST(DecodeTest, JXL_TRANSCODE_JPEG_TEST(JPEGReconstructTestCodestream)) {
 
 TEST(DecodeTest, JXL_TRANSCODE_JPEG_TEST(JPEGReconstructionTest)) {
   const std::string jpeg_path = "jxl/flower/flower.png.im_q85_420.jpg";
-  const jxl::PaddedBytes orig = jxl::ReadTestData(jpeg_path);
+  const jxl::PaddedBytes orig = jxl::test::ReadTestData(jpeg_path);
   jxl::CodecInOut orig_io;
   ASSERT_TRUE(
       jxl::jpeg::DecodeImageJPG(jxl::Span<const uint8_t>(orig), &orig_io));
@@ -4861,8 +4860,8 @@ TEST(DecodeTest, JXL_TRANSCODE_JPEG_TEST(JPEGReconstructionTest)) {
 TEST(DecodeTest, JXL_TRANSCODE_JPEG_TEST(JPEGReconstructionMetadataTest)) {
   const std::string jpeg_path = "jxl/jpeg_reconstruction/1x1_exif_xmp.jpg";
   const std::string jxl_path = "jxl/jpeg_reconstruction/1x1_exif_xmp.jxl";
-  const jxl::PaddedBytes jpeg = jxl::ReadTestData(jpeg_path);
-  const jxl::PaddedBytes jxl = jxl::ReadTestData(jxl_path);
+  const jxl::PaddedBytes jpeg = jxl::test::ReadTestData(jpeg_path);
+  const jxl::PaddedBytes jxl = jxl::test::ReadTestData(jxl_path);
   VerifyJPEGReconstruction(jxl, jpeg);
 }
 
@@ -4933,7 +4932,7 @@ bool BoxTypeEquals(const std::string& type_string, JxlBoxType type) {
 
 TEST(DecodeTest, ExtentedBoxSizeTest) {
   const std::string jxl_path = "jxl/boxes/square-extended-size-container.jxl";
-  const jxl::PaddedBytes orig = jxl::ReadTestData(jxl_path);
+  const jxl::PaddedBytes orig = jxl::test::ReadTestData(jxl_path);
   JxlDecoder* dec = JxlDecoderCreate(nullptr);
 
   EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderSubscribeEvents(dec, JXL_DEC_BOX));

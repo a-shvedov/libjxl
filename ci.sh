@@ -21,7 +21,9 @@ CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}
 CMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER:-}
 CMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER:-}
 CMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM:-}
+SKIP_BUILD="${SKIP_BUILD:-0}"
 SKIP_TEST="${SKIP_TEST:-0}"
+TARGETS="${TARGETS:-all doc}"
 TEST_SELECTOR="${TEST_SELECTOR:-}"
 BUILD_TARGET="${BUILD_TARGET:-}"
 ENABLE_WASM_SIMD="${ENABLE_WASM_SIMD:-0}"
@@ -458,9 +460,12 @@ cmake_configure() {
 }
 
 cmake_build_and_test() {
+  if [[ "${SKIP_BUILD}" -eq "1" ]]; then
+      return 0
+  fi
   # gtest_discover_tests() runs the test binaries to discover the list of tests
   # at build time, which fails under qemu.
-  ASAN_OPTIONS=detect_leaks=0 cmake --build "${BUILD_DIR}" -- all doc
+  ASAN_OPTIONS=detect_leaks=0 cmake --build "${BUILD_DIR}" -- $TARGETS
   # Pack test binaries if requested.
   if [[ "${PACK_TEST:-}" == "1" ]]; then
     (cd "${BUILD_DIR}"
@@ -795,7 +800,7 @@ _cmd_ossfuzz() {
     -e MSAN_LIBS_PATH="/work/msan" \
     -e JPEGXL_EXTRA_ARGS="${jpegxl_extra_args}" \
     -v "${MYDIR}":/src/libjxl \
-    -v "${MYDIR}/tools/ossfuzz-build.sh":/src/build.sh \
+    -v "${MYDIR}/tools/scripts/ossfuzz-build.sh":/src/build.sh \
     -v "${real_build_dir}":/work \
     gcr.io/oss-fuzz/libjxl
 }
@@ -1191,22 +1196,38 @@ cmd_fuzz() {
   )
 }
 
-# Runs the linter (clang-format) on the pending CLs.
+# Runs the linters (clang-format, build_cleaner, buildirier) on the pending CLs.
 cmd_lint() {
   merge_request_commits
   { set +x; } 2>/dev/null
-  local versions=(${1:-6.0 7 8 9 10 11})
+  local versions=(${1:-16 15 14 13 12 11 10 9 8 7 6.0})
   local clang_format_bins=("${versions[@]/#/clang-format-}" clang-format)
   local tmpdir=$(mktemp -d)
   CLEANUP_FILES+=("${tmpdir}")
 
   local ret=0
   local build_patch="${tmpdir}/build_cleaner.patch"
-  if ! "${MYDIR}/tools/build_cleaner.py" >"${build_patch}"; then
+  if ! "${MYDIR}/tools/scripts/build_cleaner.py" >"${build_patch}"; then
     ret=1
     echo "build_cleaner.py findings:" >&2
     "${COLORDIFF_BIN}" <"${build_patch}"
-    echo "Run \`tools/build_cleaner.py --update\` to apply them" >&2
+    echo "Run \`tools/scripts/build_cleaner.py --update\` to apply them" >&2
+  fi
+
+  # It is ok, if buildifier is not installed.
+  if which buildifier >/dev/null; then
+    local buildifier_patch="${tmpdir}/buildifier.patch"
+    local bazel_files=`git -C ${MYDIR} ls-files | grep -E "/BUILD$|WORKSPACE|.bzl$"`
+    set -x
+    buildifier -d ${bazel_files} >"${buildifier_patch}"|| true
+    { set +x; } 2>/dev/null
+    if [ -s "${buildifier_patch}" ]; then
+      ret=1
+      echo 'buildifier have found some problems in Bazel build files:' >&2
+      "${COLORDIFF_BIN}" <"${buildifier_patch}"
+      echo 'To fix them run (from the base directory):' >&2
+      echo '  buildifier `git ls-files | grep -E "/BUILD$|WORKSPACE|.bzl$"`' >&2
+    fi
   fi
 
   local installed=()
@@ -1415,7 +1436,7 @@ cmd_bump_version() {
     -i .github/workflows/conformance.yml
 
   # Update lib.gni
-  tools/build_cleaner.py --update
+  tools/scripts/build_cleaner.py --update
 
   # Mark the previous version as "unstable".
   DEBCHANGE_RELEASE_HEURISTIC=log dch -M --distribution unstable --release ''
@@ -1433,7 +1454,7 @@ cmd_authors() {
   readarray -t names < <(git log --format='%an' "${MR_ANCESTOR_SHA}..${MR_HEAD_SHA}")
   for i in "${!names[@]}"; do
     echo "Checking name '${names[$i]}' with email '${emails[$i]}' ..."
-    "${MYDIR}"/tools/check_author.py "${emails[$i]}" "${names[$i]}"
+    "${MYDIR}"/tools/scripts/check_author.py "${emails[$i]}" "${names[$i]}"
   done
 }
 
@@ -1461,7 +1482,7 @@ Where cmd is one of:
  benchmark Run the benchmark over the default corpus.
  fast_benchmark Run the benchmark over the small corpus.
 
- coverage  Buils and run tests with coverage support. Runs coverage_report as
+ coverage  Build and run tests with coverage support. Runs coverage_report as
            well.
  coverage_report Generate HTML, XML and text coverage report after a coverage
            run.
@@ -1494,6 +1515,7 @@ You can pass some optional environment variables as well:
  - FUZZER_MAX_TIME: "fuzz" command fuzzer running timeout in seconds.
  - LINT_OUTPUT: Path to the output patch from the "lint" command.
  - SKIP_CPUSET=1: Skip modifying the cpuset in the arm_benchmark.
+ - SKIP_BUILD=1: Skip the build stage, cmake configure only.
  - SKIP_TEST=1: Skip the test stage.
  - STORE_IMAGES=0: Makes the benchmark discard the computed images.
  - TEST_STACK_LIMIT: Stack size limit (ulimit -s) during tests, in KiB.

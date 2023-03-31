@@ -3,7 +3,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "jxl/decode.h"
+#include <jxl/decode.h>
+#include <jxl/types.h>
 
 #include <algorithm>
 #include <array>
@@ -12,7 +13,6 @@
 #include <utility>
 #include <vector>
 
-#include "jxl/types.h"
 #include "lib/jxl/base/byte_order.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
@@ -636,7 +636,7 @@ struct JxlDecoderStruct {
   // This returns false if the user didn't subscribe to any events that
   // require the codestream (e.g. only subscribed to metadata boxes), or all
   // parts of the codestream that are subscribed to (e.g. only basic info) have
-  // already occured.
+  // already occurred.
   bool CanUseMoreCodestreamInput() const {
     // The decoder can set this to finished early if all relevant events were
     // processed, so this check works.
@@ -890,11 +890,11 @@ JxlDecoderStatus JxlDecoderSubscribeEvents(JxlDecoder* dec, int events_wanted) {
 }
 
 JxlDecoderStatus JxlDecoderSetKeepOrientation(JxlDecoder* dec,
-                                              JXL_BOOL keep_orientation) {
+                                              JXL_BOOL skip_reorientation) {
   if (dec->stage != DecoderStage::kInited) {
     return JXL_API_ERROR("Must set keep_orientation option before starting");
   }
-  dec->keep_orientation = !!keep_orientation;
+  dec->keep_orientation = !!skip_reorientation;
   return JXL_DEC_SUCCESS;
 }
 
@@ -1253,11 +1253,8 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
       Span<const uint8_t> span;
       JXL_API_RETURN_IF_ERROR(dec->GetCodestreamInput(&span));
       auto reader = GetBitReader(span);
-      bool output_needed =
-          (dec->preview_frame ? (dec->events_wanted & JXL_DEC_PREVIEW_IMAGE)
-                              : (dec->events_wanted & JXL_DEC_FULL_IMAGE));
       jxl::Status status = dec->frame_dec->InitFrame(
-          reader.get(), dec->ib.get(), dec->preview_frame, output_needed);
+          reader.get(), dec->ib.get(), dec->preview_frame);
       if (!reader->AllReadsWithinBounds() ||
           status.code() == StatusCode::kNotEnoughBytes) {
         return dec->RequestMoreInput();
@@ -1270,6 +1267,12 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
       if (!CheckSizeLimit(dec, frame_dim.xsize_upsampled_padded,
                           frame_dim.ysize_upsampled_padded)) {
         return JXL_API_ERROR("frame is too large");
+      }
+      bool output_needed =
+          (dec->preview_frame ? (dec->events_wanted & JXL_DEC_PREVIEW_IMAGE)
+                              : (dec->events_wanted & JXL_DEC_FULL_IMAGE));
+      if (output_needed) {
+        JXL_API_RETURN_IF_ERROR(dec->frame_dec->InitFrameOutput());
       }
       if (dec->cpu_limit_base != 0) {
         // No overflow, checked in CheckSizeLimit.

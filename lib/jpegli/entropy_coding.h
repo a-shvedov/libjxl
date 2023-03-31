@@ -19,15 +19,28 @@ namespace jpegli {
 
 void AddStandardHuffmanTables(j_compress_ptr cinfo, bool is_dc);
 
-void CopyHuffmanCodes(j_compress_ptr cinfo,
-                      std::vector<JPEGHuffmanCode>* huffman_codes);
+void CopyHuffmanCodes(j_compress_ptr cinfo);
 
 size_t RestartIntervalForScan(j_compress_ptr cinfo, size_t scan_index);
 
-void OptimizeHuffmanCodes(
-    j_compress_ptr cinfo,
-    const std::vector<std::vector<jpegli::coeff_t> >& coeffs,
-    std::vector<JPEGHuffmanCode>* huffman_codes);
+struct Histogram {
+  int count[kJpegHuffmanAlphabetSize];
+  Histogram() { memset(count, 0, sizeof(count)); }
+};
+
+struct JpegClusteredHistograms {
+  std::vector<Histogram> histograms;
+  std::vector<uint32_t> histogram_indexes;
+  std::vector<uint32_t> slot_ids;
+};
+
+void ClusterJpegHistograms(const Histogram* histograms, size_t num,
+                           JpegClusteredHistograms* clusters);
+
+void AddJpegHuffmanCode(const Histogram& histogram, size_t slot_id,
+                        std::vector<JPEGHuffmanCode>* huff_codes);
+
+void OptimizeHuffmanCodes(j_compress_ptr cinfo);
 
 }  // namespace jpegli
 

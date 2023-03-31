@@ -15,10 +15,9 @@
 #ifndef JXL_CODESTREAM_HEADER_H_
 #define JXL_CODESTREAM_HEADER_H_
 
+#include <jxl/types.h>
 #include <stddef.h>
 #include <stdint.h>
-
-#include "jxl/types.h"
 
 #if defined(__cplusplus) || defined(c_plusplus)
 extern "C" {
@@ -245,7 +244,7 @@ typedef struct {
    */
   uint32_t intrinsic_xsize;
 
-  /** Intrinsic heigth of the image.
+  /** Intrinsic height of the image.
    * The intrinsic size can be different from the actual size in pixels
    * (as given by xsize and ysize) and it denotes the recommended dimensions
    * for displaying the image, i.e. applications are advised to resample the

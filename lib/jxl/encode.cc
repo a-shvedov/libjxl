@@ -3,19 +3,18 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "jxl/encode.h"
-
 #include <brotli/encode.h>
+#include <jxl/codestream_header.h>
+#include <jxl/encode.h>
+#include <jxl/types.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
-#include "base/data_parallel.h"
-#include "jxl/codestream_header.h"
-#include "jxl/types.h"
 #include "lib/jxl/base/byte_order.h"
+#include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/codec_in_out.h"
 #include "lib/jxl/enc_aux_out.h"
@@ -755,9 +754,9 @@ void JxlEncoderInitBasicInfo(JxlBasicInfo* info) {
 
 void JxlEncoderInitFrameHeader(JxlFrameHeader* frame_header) {
   // For each field, the default value of the specification is used. Depending
-  // on wheter an animation frame, or a composite still blending frame, is used,
-  // different fields have to be set up by the user after initing the frame
-  // header.
+  // on whether an animation frame, or a composite still blending frame,
+  // is used, different fields have to be set up by the user after initing
+  // the frame header.
   frame_header->duration = 0;
   frame_header->timecode = 0;
   frame_header->name_length = 0;
@@ -1142,7 +1141,7 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
       frame_settings->values.cparams.resampling = value;
       return JXL_ENC_SUCCESS;
     case JXL_ENC_FRAME_SETTING_EXTRA_CHANNEL_RESAMPLING:
-      // TOOD(lode): the jxl codestream allows choosing a different resampling
+      // TODO(lode): the jxl codestream allows choosing a different resampling
       // factor for each extra channel, independently per frame. Move this
       // option to a JxlEncoderFrameSettings-option that can be set per extra
       // channel, so needs its own function rather than

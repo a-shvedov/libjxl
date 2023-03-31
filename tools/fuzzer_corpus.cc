@@ -29,7 +29,6 @@
 #include "lib/jxl/base/file_io.h"
 #include "lib/jxl/base/override.h"
 #include "lib/jxl/base/span.h"
-#include "lib/jxl/base/thread_pool_internal.h"
 #include "lib/jxl/codec_in_out.h"
 #include "lib/jxl/enc_ans.h"
 #include "lib/jxl/enc_aux_out.h"
@@ -41,6 +40,7 @@
 #include "lib/jxl/encode_internal.h"
 #include "lib/jxl/jpeg/enc_jpeg_data.h"
 #include "lib/jxl/modular/encoding/context_predict.h"
+#include "tools/thread_pool_internal.h"
 
 namespace {
 
@@ -175,7 +175,6 @@ bool GenerateFile(const char* output_dir, const ImageSpec& spec,
   }
   io.metadata.m.SetAlphaBits(spec.alpha_bit_depth, spec.alpha_is_premultiplied);
   io.metadata.m.orientation = spec.orientation;
-  io.dec_pixels = spec.width * spec.height;
   io.frames.clear();
   io.frames.reserve(spec.num_frames);
 
@@ -331,7 +330,7 @@ int main(int argc, const char** argv) {
   const char* dest_dir = nullptr;
   bool regenerate = false;
   bool quiet = false;
-  int num_threads = std::thread::hardware_concurrency();
+  size_t num_threads = std::thread::hardware_concurrency();
   for (int optind = 1; optind < argc;) {
     if (!strcmp(argv[optind], "-r")) {
       regenerate = true;
@@ -457,15 +456,14 @@ int main(int argc, const char** argv) {
     specs.back().params.noise = true;
     specs.back().override_decoder_spec = 0;
 
-    jxl::ThreadPoolInternal pool{num_threads};
-    if (!RunOnPool(
-            &pool, 0, specs.size(), jxl::ThreadPool::NoInit,
-            [&specs, dest_dir, regenerate, quiet](const uint32_t task,
-                                                  size_t /* thread */) {
-              const ImageSpec& spec = specs[task];
-              GenerateFile(dest_dir, spec, regenerate, quiet);
-            },
-            "FuzzerCorpus")) {
+    jpegxl::tools::ThreadPoolInternal pool{num_threads};
+    const auto generate = [&specs, dest_dir, regenerate, quiet](
+                              const uint32_t task, size_t /* thread */) {
+      const ImageSpec& spec = specs[task];
+      GenerateFile(dest_dir, spec, regenerate, quiet);
+    };
+    if (!RunOnPool(&pool, 0, specs.size(), jxl::ThreadPool::NoInit, generate,
+                   "FuzzerCorpus")) {
       std::cerr << "Error generating fuzzer corpus" << std::endl;
       return 1;
     }

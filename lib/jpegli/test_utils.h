@@ -3,46 +3,221 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+#ifndef LIB_JPEGLI_TEST_UTILS_H_
+#define LIB_JPEGLI_TEST_UTILS_H_
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <algorithm>
+#include <string>
 #include <vector>
 
-#include "gtest/gtest.h"
-#include "lib/jxl/base/file_io.h"
+/* clang-format off */
+#include <stdio.h>
+#include <jpeglib.h>
+#include <setjmp.h>
+/* clang-format on */
 
-#if !defined(TEST_DATA_PATH)
-#include "tools/cpp/runfiles/runfiles.h"
-#endif
-
-// googletest before 1.10 didn't define INSTANTIATE_TEST_SUITE_P() but instead
-// used INSTANTIATE_TEST_CASE_P which is now deprecated.
-#ifdef INSTANTIATE_TEST_SUITE_P
-#define JPEGLI_INSTANTIATE_TEST_SUITE_P INSTANTIATE_TEST_SUITE_P
-#else
-#define JPEGLI_INSTANTIATE_TEST_SUITE_P INSTANTIATE_TEST_CASE_P
-#endif
+#include "lib/jpegli/common.h"
 
 namespace jpegli {
 
-#if defined(TEST_DATA_PATH)
-std::string GetTestDataPath(const std::string& filename) {
-  return std::string(TEST_DATA_PATH "/") + filename;
+// We define this here as well to make sure that the *_api_test.cc tests only
+// use the public API and therefore we don't include any *_internal.h headers.
+template <typename T1, typename T2>
+constexpr inline T1 DivCeil(T1 a, T2 b) {
+  return (a + b - 1) / b;
 }
-#else
-using bazel::tools::cpp::runfiles::Runfiles;
-const std::unique_ptr<Runfiles> kRunfiles(Runfiles::Create(""));
-std::string GetTestDataPath(const std::string& filename) {
-  return kRunfiles->Rlocation("__main__/testdata/" + filename);
-}
-#endif
 
-static inline std::vector<uint8_t> ReadTestData(const std::string& filename) {
-  std::string full_path = GetTestDataPath(filename);
-  std::vector<uint8_t> data;
-  fprintf(stderr, "ReadTestData %s\n", full_path.c_str());
-  JXL_CHECK(jxl::ReadFile(full_path, &data));
-  printf("Test data %s is %d bytes long.\n", filename.c_str(),
-         static_cast<int>(data.size()));
-  return data;
-}
+#define ERROR_HANDLER_SETUP(flavor)                                \
+  jpeg_error_mgr jerr;                                             \
+  jmp_buf env;                                                     \
+  cinfo.err = flavor##_std_error(&jerr);                           \
+  if (setjmp(env)) {                                               \
+    return false;                                                  \
+  }                                                                \
+  cinfo.client_data = reinterpret_cast<void*>(&env);               \
+  cinfo.err->error_exit = [](j_common_ptr cinfo) {                 \
+    (*cinfo->err->output_message)(cinfo);                          \
+    jmp_buf* env = reinterpret_cast<jmp_buf*>(cinfo->client_data); \
+    flavor##_destroy(cinfo);                                       \
+    longjmp(*env, 1);                                              \
+  };
+
+#define ARRAY_SIZE(X) (sizeof(X) / sizeof((X)[0]))
+
+static constexpr int kSpecialMarker = 0xe5;
+static constexpr uint8_t kMarkerData[] = {0, 1, 255, 0, 17};
+static constexpr uint8_t kMarkerSequence[] = {0xe6, 0xe8, 0xe7,
+                                              0xe6, 0xe7, 0xe8};
+static constexpr size_t kMarkerSequenceLen = ARRAY_SIZE(kMarkerSequence);
+
+static constexpr jpeg_scan_info kScript1[] = {
+    {3, {0, 1, 2}, 0, 0, 0, 0},
+    {1, {0}, 1, 63, 0, 0},
+    {1, {1}, 1, 63, 0, 0},
+    {1, {2}, 1, 63, 0, 0},
+};
+static constexpr jpeg_scan_info kScript2[] = {
+    {1, {0}, 0, 0, 0, 0},  {1, {1}, 0, 0, 0, 0},  {1, {2}, 0, 0, 0, 0},
+    {1, {0}, 1, 63, 0, 0}, {1, {1}, 1, 63, 0, 0}, {1, {2}, 1, 63, 0, 0},
+};
+static constexpr jpeg_scan_info kScript3[] = {
+    {3, {0, 1, 2}, 0, 0, 0, 0}, {1, {0}, 1, 63, 0, 1}, {1, {1}, 1, 63, 0, 1},
+    {1, {2}, 1, 63, 0, 1},      {1, {0}, 1, 63, 1, 0}, {1, {1}, 1, 63, 1, 0},
+    {1, {2}, 1, 63, 1, 0},
+};
+
+struct ScanScript {
+  int num_scans;
+  const jpeg_scan_info* scans;
+};
+
+static constexpr ScanScript kTestScript[] = {
+    {ARRAY_SIZE(kScript1), kScript1},
+    {ARRAY_SIZE(kScript2), kScript2},
+    {ARRAY_SIZE(kScript3), kScript3},
+};
+static constexpr int kNumTestScripts = ARRAY_SIZE(kTestScript);
+
+static constexpr int kLastScan = 0xffff;
+
+static uint32_t kTestColorMap[] = {
+    0x000000, 0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0x00ffff,
+    0xff00ff, 0xffffff, 0x6251fc, 0x45d9c7, 0xa7f059, 0xd9a945,
+    0xfa4e44, 0xceaffc, 0xbad7db, 0xc1f0b1, 0xdbca9a, 0xfacac5,
+    0xf201ff, 0x0063db, 0x00f01c, 0xdbb204, 0xf12f0c, 0x7ba1dc};
+static constexpr int kTestColorMapNumColors = ARRAY_SIZE(kTestColorMap);
+
+std::string IOMethodName(JpegliDataType data_type, JpegliEndianness endianness);
+
+std::string ColorSpaceName(J_COLOR_SPACE colorspace);
+
+enum JpegIOMode {
+  PIXELS,
+  RAW_DATA,
+  COEFFICIENTS,
+};
+
+struct CustomQuantTable {
+  int slot_idx = 0;
+  uint16_t table_type = 0;
+  int scale_factor = 100;
+  bool add_raw = false;
+  bool force_baseline = true;
+  std::vector<unsigned int> basic_table;
+  std::vector<unsigned int> quantval;
+  void Generate();
+};
+
+struct TestImage {
+  size_t xsize = 2268;
+  size_t ysize = 1512;
+  J_COLOR_SPACE color_space = JCS_RGB;
+  size_t components = 3;
+  JpegliDataType data_type = JPEGLI_TYPE_UINT8;
+  JpegliEndianness endianness = JPEGLI_NATIVE_ENDIAN;
+  std::vector<uint8_t> pixels;
+  std::vector<std::vector<uint8_t>> raw_data;
+  std::vector<std::vector<JCOEF>> coeffs;
+  void AllocatePixels() {
+    pixels.resize(ysize * xsize * components *
+                  jpegli_bytes_per_sample(data_type));
+  }
+};
+
+std::ostream& operator<<(std::ostream& os, const TestImage& input);
+
+struct CompressParams {
+  int quality = 90;
+  bool set_jpeg_colorspace = false;
+  J_COLOR_SPACE jpeg_color_space = JCS_UNKNOWN;
+  std::vector<int> quant_indexes;
+  std::vector<CustomQuantTable> quant_tables;
+  std::vector<int> h_sampling;
+  std::vector<int> v_sampling;
+  std::vector<int> comp_ids;
+  int override_JFIF = -1;
+  int override_Adobe = -1;
+  bool add_marker = false;
+  int progressive_id = 0;
+  int progressive_level = -1;
+  unsigned int restart_interval = 0;
+  int restart_in_rows = 0;
+  bool optimize_coding = true;
+  bool use_flat_dc_luma_code = false;
+  bool xyb_mode = false;
+  bool libjpeg_mode = false;
+
+  int h_samp(int c) const { return h_sampling.empty() ? 1 : h_sampling[c]; }
+  int v_samp(int c) const { return v_sampling.empty() ? 1 : v_sampling[c]; }
+  int max_h_sample() const {
+    auto it = std::max_element(h_sampling.begin(), h_sampling.end());
+    return it == h_sampling.end() ? 1 : *it;
+  }
+  int max_v_sample() const {
+    auto it = std::max_element(v_sampling.begin(), v_sampling.end());
+    return it == v_sampling.end() ? 1 : *it;
+  }
+  int comp_width(const TestImage& input, int c) const {
+    return DivCeil(input.xsize * h_samp(c), max_h_sample() * DCTSIZE) * DCTSIZE;
+  }
+  int comp_height(const TestImage& input, int c) const {
+    return DivCeil(input.ysize * v_samp(c), max_v_sample() * DCTSIZE) * DCTSIZE;
+  }
+};
+
+std::ostream& operator<<(std::ostream& os, const CompressParams& jparams);
+
+void VerifyHeader(const CompressParams& jparams, j_decompress_ptr cinfo);
+void VerifyScanHeader(const CompressParams& jparams, j_decompress_ptr cinfo);
+
+enum ColorQuantMode {
+  CQUANT_1PASS,
+  CQUANT_2PASS,
+  CQUANT_EXTERNAL,
+  CQUANT_REUSE,
+};
+
+struct ScanDecompressParams {
+  int max_scan_number;
+  J_DITHER_MODE dither_mode;
+  ColorQuantMode color_quant_mode;
+};
+
+struct DecompressParams {
+  size_t chunk_size = 65536;
+  size_t max_output_lines = 16;
+  JpegIOMode output_mode = PIXELS;
+  JpegliDataType data_type = JPEGLI_TYPE_UINT8;
+  JpegliEndianness endianness = JPEGLI_NATIVE_ENDIAN;
+  bool set_out_color_space = false;
+  J_COLOR_SPACE out_color_space = JCS_UNKNOWN;
+  bool crop_output = false;
+  bool do_block_smoothing = false;
+  int scale_num = 1;
+  int scale_denom = 1;
+  bool quantize_colors = false;
+  int desired_number_of_colors = 256;
+  std::vector<ScanDecompressParams> scan_params;
+};
+
+void SetDecompressParams(const DecompressParams& dparams,
+                         j_decompress_ptr cinfo, bool is_jpegli);
+
+void SetScanDecompressParams(const DecompressParams& dparams,
+                             j_decompress_ptr cinfo, int scan_number,
+                             bool is_jpegli);
+
+void CopyCoefficients(j_decompress_ptr cinfo, jvirt_barray_ptr* coef_arrays,
+                      TestImage* output);
+
+void UnmapColors(uint8_t* row, size_t xsize, int components,
+                 JSAMPARRAY colormap, size_t num_colors);
+
+std::string GetTestDataPath(const std::string& filename);
+std::vector<uint8_t> ReadTestData(const std::string& filename);
 
 class PNMParser {
  public:
@@ -51,40 +226,7 @@ class PNMParser {
 
   // Sets "pos" to the first non-header byte/pixel on success.
   bool ParseHeader(const uint8_t** pos, size_t* xsize, size_t* ysize,
-                   size_t* num_channels, size_t* bitdepth) {
-    if (pos_[0] != 'P' || (pos_[1] != '5' && pos_[1] != '6')) {
-      fprintf(stderr, "Invalid PNM header.");
-      return false;
-    }
-    *num_channels = (pos_[1] == '5' ? 1 : 3);
-    pos_ += 2;
-
-    size_t maxval;
-    if (!SkipWhitespace() || !ParseUnsigned(xsize) || !SkipWhitespace() ||
-        !ParseUnsigned(ysize) || !SkipWhitespace() || !ParseUnsigned(&maxval) ||
-        !SkipWhitespace()) {
-      return false;
-    }
-    if (maxval == 0 || maxval >= 65536) {
-      fprintf(stderr, "Invalid maxval value.\n");
-      return false;
-    }
-    bool found_bitdepth = false;
-    for (int bits = 1; bits <= 16; ++bits) {
-      if (maxval == (1u << bits) - 1) {
-        *bitdepth = bits;
-        found_bitdepth = true;
-        break;
-      }
-    }
-    if (!found_bitdepth) {
-      fprintf(stderr, "Invalid maxval value.\n");
-      return false;
-    }
-
-    *pos = pos_;
-    return true;
-  }
+                   size_t* num_channels, size_t* bitdepth);
 
  private:
   static bool IsLineBreak(const uint8_t c) { return c == '\r' || c == '\n'; }
@@ -92,51 +234,54 @@ class PNMParser {
     return IsLineBreak(c) || c == '\t' || c == ' ';
   }
 
-  bool ParseUnsigned(size_t* number) {
-    if (pos_ == end_ || *pos_ < '0' || *pos_ > '9') {
-      fprintf(stderr, "Expected unsigned number.\n");
-      return false;
-    }
-    *number = 0;
-    while (pos_ < end_ && *pos_ >= '0' && *pos_ <= '9') {
-      *number *= 10;
-      *number += *pos_ - '0';
-      ++pos_;
-    }
+  bool ParseUnsigned(size_t* number);
 
-    return true;
-  }
-
-  bool SkipWhitespace() {
-    if (pos_ == end_ || !IsWhitespace(*pos_)) {
-      fprintf(stderr, "Expected whitespace.\n");
-      return false;
-    }
-    while (pos_ < end_ && IsWhitespace(*pos_)) {
-      ++pos_;
-    }
-    return true;
-  }
+  bool SkipWhitespace();
 
   const uint8_t* pos_;
   const uint8_t* const end_;
 };
 
-static inline bool ReadPNM(const std::vector<uint8_t>& data, size_t* xsize,
-                           size_t* ysize, size_t* num_channels,
-                           size_t* bitdepth, std::vector<uint8_t>* pixels) {
-  if (data.size() < 2) {
-    fprintf(stderr, "PNM file too small.\n");
-    return false;
-  }
-  PNMParser parser(data.data(), data.size());
-  const uint8_t* pos = nullptr;
-  if (!parser.ParseHeader(&pos, xsize, ysize, num_channels, bitdepth)) {
-    return false;
-  }
-  pixels->resize(data.data() + data.size() - pos);
-  memcpy(&(*pixels)[0], pos, pixels->size());
-  return true;
-}
+bool ReadPNM(const std::vector<uint8_t>& data, size_t* xsize, size_t* ysize,
+             size_t* num_channels, size_t* bitdepth,
+             std::vector<uint8_t>* pixels);
+
+void SetNumChannels(J_COLOR_SPACE colorspace, size_t* channels);
+
+void ConvertPixel(const uint8_t* input_rgb, uint8_t* out,
+                  J_COLOR_SPACE colorspace, size_t num_channels);
+
+void GeneratePixels(TestImage* img);
+
+void GenerateRawData(const CompressParams& jparams, TestImage* img);
+
+void GenerateCoeffs(const CompressParams& jparams, TestImage* img);
+
+bool EncodeWithJpegli(const TestImage& input, const CompressParams& jparams,
+                      std::vector<uint8_t>* compressed);
+
+// Verifies that an image encoded with libjpegli can be decoded with libjpeg,
+// and checks that the jpeg coding metadata matches jparams.
+void DecodeAllScansWithLibjpeg(const CompressParams& jparams,
+                               const DecompressParams& dparams,
+                               const std::vector<uint8_t>& compressed,
+                               std::vector<TestImage>* output_progression);
+void DecodeWithLibjpeg(const CompressParams& jparams,
+                       const DecompressParams& dparams,
+                       const std::vector<uint8_t>& compressed,
+                       TestImage* output);
+
+double DistanceRms(const TestImage& input, const TestImage& output,
+                   size_t start_line, size_t num_lines);
+
+double DistanceRms(const TestImage& input, const TestImage& output);
+
+void VerifyOutputImage(const TestImage& input, const TestImage& output,
+                       size_t start_line, size_t num_lines, double max_rms);
+
+void VerifyOutputImage(const TestImage& input, const TestImage& output,
+                       double max_rms);
 
 }  // namespace jpegli
+
+#endif  // LIB_JPEGLI_TEST_UTILS_H_
