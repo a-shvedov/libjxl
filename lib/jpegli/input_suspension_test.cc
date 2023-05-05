@@ -19,9 +19,16 @@
 namespace jpegli {
 namespace {
 
+static constexpr uint8_t kFakeEoiMarker[2] = {0xff, 0xd9};
+
 struct SourceManager {
-  SourceManager(const uint8_t* data, size_t len, size_t max_chunk_size)
-      : data_(data), len_(len), pos_(0), max_chunk_size_(max_chunk_size) {
+  SourceManager(const uint8_t* data, size_t len, size_t max_chunk_size,
+                bool is_partial_file)
+      : data_(data),
+        len_(len),
+        pos_(0),
+        max_chunk_size_(max_chunk_size),
+        is_partial_file_(is_partial_file) {
     pub_.init_source = init_source;
     pub_.fill_input_buffer = fill_input_buffer;
     pub_.next_input_byte = nullptr;
@@ -34,20 +41,24 @@ struct SourceManager {
 
   ~SourceManager() {
     EXPECT_EQ(0, pub_.bytes_in_buffer);
-    EXPECT_EQ(len_, pos_);
+    if (!is_partial_file_) {
+      EXPECT_EQ(len_, pos_);
+    }
   }
 
   bool LoadNextChunk() {
-    if (pos_ >= len_) {
+    if (pos_ >= len_ && !is_partial_file_) {
       return false;
     }
     if (pub_.bytes_in_buffer > 0) {
       EXPECT_LE(pub_.bytes_in_buffer, buffer_.size());
       memmove(&buffer_[0], pub_.next_input_byte, pub_.bytes_in_buffer);
     }
-    size_t chunk_size = std::min(len_ - pos_, max_chunk_size_);
+    size_t chunk_size =
+        pos_ < len_ ? std::min(len_ - pos_, max_chunk_size_) : 2;
     buffer_.resize(pub_.bytes_in_buffer + chunk_size);
-    memcpy(&buffer_[pub_.bytes_in_buffer], data_ + pos_, chunk_size);
+    memcpy(&buffer_[pub_.bytes_in_buffer],
+           pos_ < len_ ? data_ + pos_ : kFakeEoiMarker, chunk_size);
     pub_.next_input_byte = &buffer_[0];
     pub_.bytes_in_buffer += chunk_size;
     pos_ += chunk_size;
@@ -61,6 +72,7 @@ struct SourceManager {
   size_t len_;
   size_t pos_;
   size_t max_chunk_size_;
+  bool is_partial_file_;
 
   static void init_source(j_decompress_ptr cinfo) {
     auto src = reinterpret_cast<SourceManager*>(cinfo->src);
@@ -70,10 +82,44 @@ struct SourceManager {
 
   static boolean fill_input_buffer(j_decompress_ptr cinfo) { return FALSE; }
 
-  static void skip_input_data(j_decompress_ptr cinfo, long num_bytes) {}
+  static void skip_input_data(j_decompress_ptr cinfo, long num_bytes) {
+    auto src = reinterpret_cast<SourceManager*>(cinfo->src);
+    if (num_bytes <= 0) {
+      return;
+    }
+    if (src->pub_.bytes_in_buffer >= static_cast<size_t>(num_bytes)) {
+      src->pub_.bytes_in_buffer -= num_bytes;
+      src->pub_.next_input_byte += num_bytes;
+    } else {
+      src->pos_ += num_bytes - src->pub_.bytes_in_buffer;
+      src->pub_.bytes_in_buffer = 0;
+    }
+  }
 
   static void term_source(j_decompress_ptr cinfo) {}
 };
+
+uint8_t markers_seen[kMarkerSequenceLen];
+size_t num_markers_seen = 0;
+
+uint8_t get_next_byte(j_decompress_ptr cinfo) {
+  cinfo->src->bytes_in_buffer--;
+  return *cinfo->src->next_input_byte++;
+}
+
+boolean test_marker_processor(j_decompress_ptr cinfo) {
+  markers_seen[num_markers_seen] = cinfo->unread_marker;
+  if (cinfo->src->bytes_in_buffer < 2) {
+    return FALSE;
+  }
+  size_t marker_len = (get_next_byte(cinfo) << 8) + get_next_byte(cinfo);
+  EXPECT_EQ(2 + ((num_markers_seen + 2) % sizeof(kMarkerData)), marker_len);
+  if (marker_len > 2) {
+    (*cinfo->src->skip_input_data)(cinfo, marker_len - 2);
+  }
+  ++num_markers_seen;
+  return TRUE;
+}
 
 void ReadOutputImage(const DecompressParams& dparams, j_decompress_ptr cinfo,
                      SourceManager* src, TestImage* output) {
@@ -148,6 +194,7 @@ struct TestConfig {
   TestImage input;
   CompressParams jparams;
   DecompressParams dparams;
+  float max_rms_dist = 1.0f;
 };
 
 std::vector<uint8_t> GetTestJpegData(TestConfig& config) {
@@ -160,13 +207,25 @@ std::vector<uint8_t> GetTestJpegData(TestConfig& config) {
   return compressed;
 }
 
+bool IsSequential(const TestConfig& config) {
+  if (!config.fn.empty()) {
+    return config.fn_desc.find("PROGR") == std::string::npos;
+  }
+  return config.jparams.progressive_mode <= 0;
+}
+
 class InputSuspensionTestParam : public ::testing::TestWithParam<TestConfig> {};
 
 TEST_P(InputSuspensionTestParam, InputOutputLockStepNonBuffered) {
   TestConfig config = GetParam();
   const DecompressParams& dparams = config.dparams;
-  const std::vector<uint8_t> compressed = GetTestJpegData(config);
-  SourceManager src(compressed.data(), compressed.size(), dparams.chunk_size);
+  std::vector<uint8_t> compressed = GetTestJpegData(config);
+  bool is_partial = config.dparams.size_factor < 1.0f;
+  if (is_partial) {
+    compressed.resize(compressed.size() * config.dparams.size_factor);
+  }
+  SourceManager src(compressed.data(), compressed.size(), dparams.chunk_size,
+                    is_partial);
   TestImage output0;
   jpeg_decompress_struct cinfo;
   const auto try_catch_block = [&]() -> bool {
@@ -174,9 +233,23 @@ TEST_P(InputSuspensionTestParam, InputOutputLockStepNonBuffered) {
     jpegli_create_decompress(&cinfo);
     cinfo.src = reinterpret_cast<jpeg_source_mgr*>(&src);
 
+    if (config.jparams.add_marker) {
+      jpegli_save_markers(&cinfo, kSpecialMarker0, 0xffff);
+      jpegli_save_markers(&cinfo, kSpecialMarker1, 0xffff);
+      num_markers_seen = 0;
+      jpegli_set_marker_processor(&cinfo, 0xe6, test_marker_processor);
+      jpegli_set_marker_processor(&cinfo, 0xe7, test_marker_processor);
+      jpegli_set_marker_processor(&cinfo, 0xe8, test_marker_processor);
+    }
     while (jpegli_read_header(&cinfo, TRUE) == JPEG_SUSPENDED) {
       JXL_CHECK(src.LoadNextChunk());
     }
+    SetDecompressParams(dparams, &cinfo, true);
+    if (config.jparams.add_marker) {
+      EXPECT_EQ(num_markers_seen, kMarkerSequenceLen);
+      EXPECT_EQ(0, memcmp(markers_seen, kMarkerSequence, num_markers_seen));
+    }
+    VerifyHeader(config.jparams, &cinfo);
     cinfo.raw_data_out = dparams.output_mode == RAW_DATA;
 
     if (dparams.output_mode == COEFFICIENTS) {
@@ -201,25 +274,33 @@ TEST_P(InputSuspensionTestParam, InputOutputLockStepNonBuffered) {
   jpegli_destroy_decompress(&cinfo);
 
   TestImage output1;
-  DecodeWithLibjpeg(CompressParams(), dparams, compressed, &output1);
-  VerifyOutputImage(output1, output0, 1.0f);
+  DecodeWithLibjpeg(config.jparams, dparams, compressed, &output1);
+  VerifyOutputImage(output1, output0, config.max_rms_dist);
 }
 
 TEST_P(InputSuspensionTestParam, InputOutputLockStepBuffered) {
   TestConfig config = GetParam();
+  if (config.jparams.add_marker) return;
   const DecompressParams& dparams = config.dparams;
-  const std::vector<uint8_t> compressed = GetTestJpegData(config);
-  SourceManager src(compressed.data(), compressed.size(), dparams.chunk_size);
+  std::vector<uint8_t> compressed = GetTestJpegData(config);
+  bool is_partial = config.dparams.size_factor < 1.0f;
+  if (is_partial) {
+    compressed.resize(compressed.size() * config.dparams.size_factor);
+  }
+  SourceManager src(compressed.data(), compressed.size(), dparams.chunk_size,
+                    is_partial);
   std::vector<TestImage> output_progression0;
   jpeg_decompress_struct cinfo;
   const auto try_catch_block = [&]() -> bool {
     ERROR_HANDLER_SETUP(jpegli);
     jpegli_create_decompress(&cinfo);
+
     cinfo.src = reinterpret_cast<jpeg_source_mgr*>(&src);
 
     while (jpegli_read_header(&cinfo, TRUE) == JPEG_SUSPENDED) {
       JXL_CHECK(src.LoadNextChunk());
     }
+    SetDecompressParams(dparams, &cinfo, true);
 
     cinfo.buffered_image = TRUE;
     cinfo.raw_data_out = dparams.output_mode == RAW_DATA;
@@ -260,24 +341,30 @@ TEST_P(InputSuspensionTestParam, InputOutputLockStepBuffered) {
   jpegli_destroy_decompress(&cinfo);
 
   std::vector<TestImage> output_progression1;
-  DecodeAllScansWithLibjpeg(CompressParams(), dparams, compressed,
+  DecodeAllScansWithLibjpeg(config.jparams, dparams, compressed,
                             &output_progression1);
   ASSERT_EQ(output_progression0.size(), output_progression1.size());
   for (size_t i = 0; i < output_progression0.size(); ++i) {
     const TestImage& output = output_progression0[i];
     const TestImage& expected = output_progression1[i];
-    VerifyOutputImage(expected, output, 1.0);
+    VerifyOutputImage(expected, output, config.max_rms_dist);
   }
 }
 
 TEST_P(InputSuspensionTestParam, PreConsumeInputBuffered) {
   TestConfig config = GetParam();
+  if (config.jparams.add_marker) return;
   const DecompressParams& dparams = config.dparams;
-  const std::vector<uint8_t> compressed = GetTestJpegData(config);
+  std::vector<uint8_t> compressed = GetTestJpegData(config);
+  bool is_partial = config.dparams.size_factor < 1.0f;
+  if (is_partial) {
+    compressed.resize(compressed.size() * config.dparams.size_factor);
+  }
   std::vector<TestImage> output_progression1;
-  DecodeAllScansWithLibjpeg(CompressParams(), dparams, compressed,
+  DecodeAllScansWithLibjpeg(config.jparams, dparams, compressed,
                             &output_progression1);
-  SourceManager src(compressed.data(), compressed.size(), dparams.chunk_size);
+  SourceManager src(compressed.data(), compressed.size(), dparams.chunk_size,
+                    is_partial);
   TestImage output0;
   jpeg_decompress_struct cinfo;
   const auto try_catch_block = [&]() -> bool {
@@ -294,6 +381,7 @@ TEST_P(InputSuspensionTestParam, PreConsumeInputBuffered) {
     EXPECT_EQ(JPEG_REACHED_SOS, jpegli_consume_input(&cinfo));
     cinfo.buffered_image = TRUE;
     cinfo.raw_data_out = dparams.output_mode == RAW_DATA;
+    cinfo.do_block_smoothing = dparams.do_block_smoothing;
 
     EXPECT_TRUE(jpegli_start_decompress(&cinfo));
     EXPECT_FALSE(jpegli_input_complete(&cinfo));
@@ -330,14 +418,20 @@ TEST_P(InputSuspensionTestParam, PreConsumeInputBuffered) {
   ASSERT_TRUE(try_catch_block());
   jpegli_destroy_decompress(&cinfo);
 
-  VerifyOutputImage(output_progression1.back(), output0, 1.0f);
+  VerifyOutputImage(output_progression1.back(), output0, config.max_rms_dist);
 }
 
 TEST_P(InputSuspensionTestParam, PreConsumeInputNonBuffered) {
   TestConfig config = GetParam();
+  if (config.jparams.add_marker || IsSequential(config)) return;
   const DecompressParams& dparams = config.dparams;
-  const std::vector<uint8_t> compressed = GetTestJpegData(config);
-  SourceManager src(compressed.data(), compressed.size(), dparams.chunk_size);
+  std::vector<uint8_t> compressed = GetTestJpegData(config);
+  bool is_partial = config.dparams.size_factor < 1.0f;
+  if (is_partial) {
+    compressed.resize(compressed.size() * config.dparams.size_factor);
+  }
+  SourceManager src(compressed.data(), compressed.size(), dparams.chunk_size,
+                    is_partial);
   TestImage output0;
   jpeg_decompress_struct cinfo;
   const auto try_catch_block = [&]() -> bool {
@@ -353,6 +447,7 @@ TEST_P(InputSuspensionTestParam, PreConsumeInputNonBuffered) {
     }
     EXPECT_EQ(JPEG_REACHED_SOS, jpegli_consume_input(&cinfo));
     cinfo.raw_data_out = dparams.output_mode == RAW_DATA;
+    cinfo.do_block_smoothing = dparams.do_block_smoothing;
 
     if (dparams.output_mode == COEFFICIENTS) {
       jpegli_read_coefficients(&cinfo);
@@ -383,8 +478,8 @@ TEST_P(InputSuspensionTestParam, PreConsumeInputNonBuffered) {
   jpegli_destroy_decompress(&cinfo);
 
   TestImage output1;
-  DecodeWithLibjpeg(CompressParams(), dparams, compressed, &output1);
-  VerifyOutputImage(output1, output0, 1.0f);
+  DecodeWithLibjpeg(config.jparams, dparams, compressed, &output1);
+  VerifyOutputImage(output1, output0, config.max_rms_dist);
 }
 
 std::vector<TestConfig> GenerateTests() {
@@ -416,7 +511,55 @@ std::vector<TestConfig> GenerateTests() {
     for (size_t chunk_size : {1, 65536}) {
       TestConfig config;
       config.dparams.chunk_size = chunk_size;
+      config.jparams.progressive_mode = 2;
       config.jparams.restart_interval = r;
+      all_tests.push_back(config);
+    }
+  }
+  for (size_t chunk_size : {1, 4, 1024}) {
+    TestConfig config;
+    config.input.xsize = 256;
+    config.input.ysize = 256;
+    config.dparams.chunk_size = chunk_size;
+    config.jparams.add_marker = true;
+    all_tests.push_back(config);
+  }
+  // Tests for partial input.
+  for (float size_factor : {0.1f, 0.33f, 0.5f, 0.75f}) {
+    for (int progr : {0, 1, 3}) {
+      for (int samp : {1, 2}) {
+        for (JpegIOMode output_mode : {PIXELS, RAW_DATA}) {
+          TestConfig config;
+          config.input.xsize = 517;
+          config.input.ysize = 523;
+          config.jparams.h_sampling = {samp, 1, 1};
+          config.jparams.v_sampling = {samp, 1, 1};
+          config.jparams.progressive_mode = progr;
+          config.dparams.size_factor = size_factor;
+          config.dparams.output_mode = output_mode;
+          // The last partially available block can behave differently.
+          // TODO(szabadka) Figure out if we can make the behaviour more
+          // similar.
+          config.max_rms_dist = samp == 1 ? 1.7f : 3.0f;
+          all_tests.push_back(config);
+        }
+      }
+    }
+  }
+  // Tests for block smoothing.
+  for (float size_factor : {0.1f, 0.33f, 0.5f, 0.75f, 1.0f}) {
+    for (int samp : {1, 2}) {
+      TestConfig config;
+      config.input.xsize = 517;
+      config.input.ysize = 523;
+      config.jparams.h_sampling = {samp, 1, 1};
+      config.jparams.v_sampling = {samp, 1, 1};
+      config.jparams.progressive_mode = 2;
+      config.dparams.size_factor = size_factor;
+      config.dparams.do_block_smoothing = true;
+      // libjpeg does smoothing for incomplete scans differently at
+      // the border between current and previous scans.
+      config.max_rms_dist = 8.0f;
       all_tests.push_back(config);
     }
   }
@@ -435,6 +578,9 @@ std::ostream& operator<<(std::ostream& os, const TestConfig& c) {
   } else {
     os << "InputChunks" << c.dparams.chunk_size;
   }
+  if (c.dparams.size_factor < 1.0f) {
+    os << "Partial" << static_cast<int>(c.dparams.size_factor * 100) << "p";
+  }
   if (c.dparams.max_output_lines == 0) {
     os << "CompleteOutput";
   } else {
@@ -444,6 +590,9 @@ std::ostream& operator<<(std::ostream& os, const TestConfig& c) {
     os << "RawDataOut";
   } else if (c.dparams.output_mode == COEFFICIENTS) {
     os << "CoeffsOut";
+  }
+  if (c.dparams.do_block_smoothing) {
+    os << "BlockSmoothing";
   }
   return os;
 }

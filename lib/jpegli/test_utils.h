@@ -47,23 +47,30 @@ constexpr inline T1 DivCeil(T1 a, T2 b) {
 
 #define ARRAY_SIZE(X) (sizeof(X) / sizeof((X)[0]))
 
-static constexpr int kSpecialMarker = 0xe5;
+static constexpr int kSpecialMarker0 = 0xe5;
+static constexpr int kSpecialMarker1 = 0xe9;
 static constexpr uint8_t kMarkerData[] = {0, 1, 255, 0, 17};
 static constexpr uint8_t kMarkerSequence[] = {0xe6, 0xe8, 0xe7,
                                               0xe6, 0xe7, 0xe8};
 static constexpr size_t kMarkerSequenceLen = ARRAY_SIZE(kMarkerSequence);
 
 static constexpr jpeg_scan_info kScript1[] = {
+    {1, {0}, 0, 63, 0, 0},
+    {1, {1}, 0, 63, 0, 0},
+    {1, {2}, 0, 63, 0, 0},
+};
+
+static constexpr jpeg_scan_info kScript2[] = {
     {3, {0, 1, 2}, 0, 0, 0, 0},
     {1, {0}, 1, 63, 0, 0},
     {1, {1}, 1, 63, 0, 0},
     {1, {2}, 1, 63, 0, 0},
 };
-static constexpr jpeg_scan_info kScript2[] = {
+static constexpr jpeg_scan_info kScript3[] = {
     {1, {0}, 0, 0, 0, 0},  {1, {1}, 0, 0, 0, 0},  {1, {2}, 0, 0, 0, 0},
     {1, {0}, 1, 63, 0, 0}, {1, {1}, 1, 63, 0, 0}, {1, {2}, 1, 63, 0, 0},
 };
-static constexpr jpeg_scan_info kScript3[] = {
+static constexpr jpeg_scan_info kScript4[] = {
     {3, {0, 1, 2}, 0, 0, 0, 0}, {1, {0}, 1, 63, 0, 1}, {1, {1}, 1, 63, 0, 1},
     {1, {2}, 1, 63, 0, 1},      {1, {0}, 1, 63, 1, 0}, {1, {1}, 1, 63, 1, 0},
     {1, {2}, 1, 63, 1, 0},
@@ -78,6 +85,7 @@ static constexpr ScanScript kTestScript[] = {
     {ARRAY_SIZE(kScript1), kScript1},
     {ARRAY_SIZE(kScript2), kScript2},
     {ARRAY_SIZE(kScript3), kScript3},
+    {ARRAY_SIZE(kScript4), kScript4},
 };
 static constexpr int kNumTestScripts = ARRAY_SIZE(kTestScript);
 
@@ -125,6 +133,11 @@ struct TestImage {
     pixels.resize(ysize * xsize * components *
                   jpegli_bytes_per_sample(data_type));
   }
+  void Clear() {
+    pixels.clear();
+    raw_data.clear();
+    coeffs.clear();
+  }
 };
 
 std::ostream& operator<<(std::ostream& os, const TestImage& input);
@@ -141,14 +154,21 @@ struct CompressParams {
   int override_JFIF = -1;
   int override_Adobe = -1;
   bool add_marker = false;
-  int progressive_id = 0;
-  int progressive_level = -1;
+  bool simple_progression = false;
+  // -1 is library default
+  // 0, 1, 2 is set through jpegli_set_progressive_level()
+  // 2 + N is kScriptN
+  int progressive_mode = -1;
   unsigned int restart_interval = 0;
   int restart_in_rows = 0;
-  bool optimize_coding = true;
+  int smoothing_factor = 0;
+  int optimize_coding = -1;
   bool use_flat_dc_luma_code = false;
+  bool omit_standard_tables = false;
   bool xyb_mode = false;
   bool libjpeg_mode = false;
+  bool use_adaptive_quantization = true;
+  std::vector<uint8_t> icc;
 
   int h_samp(int c) const { return h_sampling.empty() ? 1 : h_sampling[c]; }
   int v_samp(int c) const { return v_sampling.empty() ? 1 : v_sampling[c]; }
@@ -187,6 +207,7 @@ struct ScanDecompressParams {
 };
 
 struct DecompressParams {
+  float size_factor = 1.0f;
   size_t chunk_size = 65536;
   size_t max_output_lines = 16;
   JpegIOMode output_mode = PIXELS;
@@ -196,6 +217,8 @@ struct DecompressParams {
   J_COLOR_SPACE out_color_space = JCS_UNKNOWN;
   bool crop_output = false;
   bool do_block_smoothing = false;
+  bool do_fancy_upsampling = true;
+  bool skip_scans = false;
   int scale_num = 1;
   int scale_denom = 1;
   bool quantize_colors = false;
@@ -248,14 +271,16 @@ bool ReadPNM(const std::vector<uint8_t>& data, size_t* xsize, size_t* ysize,
 
 void SetNumChannels(J_COLOR_SPACE colorspace, size_t* channels);
 
-void ConvertPixel(const uint8_t* input_rgb, uint8_t* out,
-                  J_COLOR_SPACE colorspace, size_t num_channels);
+void ConvertToGrayscale(TestImage* img);
 
 void GeneratePixels(TestImage* img);
 
 void GenerateRawData(const CompressParams& jparams, TestImage* img);
 
 void GenerateCoeffs(const CompressParams& jparams, TestImage* img);
+
+void EncodeWithJpegli(const TestImage& input, const CompressParams& jparams,
+                      j_compress_ptr cinfo);
 
 bool EncodeWithJpegli(const TestImage& input, const CompressParams& jparams,
                       std::vector<uint8_t>* compressed);
@@ -267,20 +292,26 @@ void DecodeAllScansWithLibjpeg(const CompressParams& jparams,
                                const std::vector<uint8_t>& compressed,
                                std::vector<TestImage>* output_progression);
 void DecodeWithLibjpeg(const CompressParams& jparams,
+                       const DecompressParams& dparams, j_decompress_ptr cinfo,
+                       TestImage* output);
+void DecodeWithLibjpeg(const CompressParams& jparams,
                        const DecompressParams& dparams,
                        const std::vector<uint8_t>& compressed,
                        TestImage* output);
 
 double DistanceRms(const TestImage& input, const TestImage& output,
-                   size_t start_line, size_t num_lines);
+                   size_t start_line, size_t num_lines,
+                   double* max_diff = nullptr);
 
-double DistanceRms(const TestImage& input, const TestImage& output);
+double DistanceRms(const TestImage& input, const TestImage& output,
+                   double* max_diff = nullptr);
 
 void VerifyOutputImage(const TestImage& input, const TestImage& output,
-                       size_t start_line, size_t num_lines, double max_rms);
+                       size_t start_line, size_t num_lines, double max_rms,
+                       double max_diff = 255.0);
 
 void VerifyOutputImage(const TestImage& input, const TestImage& output,
-                       double max_rms);
+                       double max_rms, double max_diff = 255.0);
 
 }  // namespace jpegli
 

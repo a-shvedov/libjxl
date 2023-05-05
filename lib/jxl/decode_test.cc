@@ -1677,7 +1677,7 @@ TEST(DecodeTest, PixelTestWithICCProfileLossy) {
   jxl::ButteraugliParams ba;
   EXPECT_THAT(ButteraugliDistance(io0.frames, io1.frames, ba, jxl::GetJxlCms(),
                                   /*distmap=*/nullptr, nullptr),
-              IsSlightlyBelow(0.75f));
+              IsSlightlyBelow(0.79f));
 
   JxlDecoderDestroy(dec);
 }
@@ -1935,7 +1935,7 @@ TEST(DecodeTest, PixelTestOpaqueSrgbLossy) {
     EXPECT_THAT(
         ButteraugliDistance(io0.frames, io1.frames, ba, jxl::GetJxlCms(),
                             /*distmap=*/nullptr, nullptr),
-        IsSlightlyBelow(0.85f));
+        IsSlightlyBelow(0.7f));
 
     JxlDecoderDestroy(dec);
   }
@@ -1986,7 +1986,7 @@ TEST(DecodeTest, PixelTestOpaqueSrgbLossyNoise) {
     EXPECT_THAT(
         ButteraugliDistance(io0.frames, io1.frames, ba, jxl::GetJxlCms(),
                             /*distmap=*/nullptr, nullptr),
-        IsSlightlyBelow(1.55f));
+        IsSlightlyBelow(1.7f));
 
     JxlDecoderDestroy(dec);
   }

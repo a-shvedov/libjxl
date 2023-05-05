@@ -22,7 +22,7 @@ namespace jpegli {
 namespace {
 static constexpr float kBaseQuantMatrixXYB[] = {
     // c = 0
-    14.4680061340f,
+    7.5629935265f,
     19.8247814178f,
     22.5724945068f,
     20.6706695557f,
@@ -87,7 +87,7 @@ static constexpr float kBaseQuantMatrixXYB[] = {
     66.9702758789f,
     39.9652709961f,
     // c = 1
-    3.1109206676f,
+    1.6262000799f,
     3.2199242115f,
     3.4903779030f,
     3.9148359299f,
@@ -152,7 +152,7 @@ static constexpr float kBaseQuantMatrixXYB[] = {
     7.0478363037f,
     6.9186143875f,
     // c = 2
-    6.3202600479f,
+    3.3038473129f,
     10.0689258575f,
     12.2785224915f,
     14.6041173935f,
@@ -220,7 +220,7 @@ static constexpr float kBaseQuantMatrixXYB[] = {
 
 static const float kBaseQuantMatrixYCbCr[] = {
     // c = 0
-    2.6928002834f,
+    1.4076321125f,
     2.6927082539f,
     2.6927735806f,
     2.9220938683f,
@@ -285,7 +285,7 @@ static const float kBaseQuantMatrixYCbCr[] = {
     5.4524297714f,
     4.3595433235f,
     // c = 1
-    5.3856005669f,
+    2.8152642250f,
     10.4298934937f,
     16.1451492310f,
     15.3725156784f,
@@ -350,7 +350,7 @@ static const float kBaseQuantMatrixYCbCr[] = {
     85.0626754761f,
     112.7605514526f,
     // c = 2
-    5.3856005669f,
+    2.8152642250f,
     5.4735932350f,
     7.3637795448f,
     6.5195322037f,
@@ -435,83 +435,13 @@ static const float kBaseQuantMatrixStd[] = {
     99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f,  //
     99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f,  //
     99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f,  //
-    // c = 2
-    17.0f, 18.0f, 24.0f, 47.0f, 99.0f, 99.0f, 99.0f, 99.0f,  //
-    18.0f, 21.0f, 26.0f, 66.0f, 99.0f, 99.0f, 99.0f, 99.0f,  //
-    24.0f, 26.0f, 56.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f,  //
-    47.0f, 66.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f,  //
-    99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f,  //
-    99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f,  //
-    99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f,  //
-    99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f, 99.0f,  //
 };
 
 constexpr float kZeroBiasMulXYB[] = {0.5f, 0.5f, 0.5f};
 constexpr float kZeroBiasMulYCbCr[] = {0.7f, 1.0f, 0.8f};
 
-constexpr unsigned char kCICPTagSignature[4] = {0x63, 0x69, 0x63, 0x70};
-constexpr size_t kCICPTagSize = 12;
 constexpr uint8_t kTransferFunctionPQ = 16;
 constexpr uint8_t kTransferFunctionHLG = 18;
-
-void LookupCICPTransferFunction(
-    const std::vector<std::vector<uint8_t>>& special_markers, uint8_t* tf) {
-  *tf = 2;  // Unknown transfer function code
-  size_t last_index = 0;
-  size_t cicp_offset = 0;
-  size_t cicp_length = 0;
-  uint8_t cicp_tag[kCICPTagSize] = {};
-  size_t cicp_pos = 0;
-  for (const auto& marker : special_markers) {
-    if (marker.size() < 18 || marker[1] != kICCMarker ||
-        (marker[2] << 8u) + marker[3] + 2u != marker.size() ||
-        memcmp(&marker[4], kICCSignature, 12) != 0) {
-      continue;
-    }
-    uint8_t index = marker[16];
-    uint8_t total = marker[17];
-    const uint8_t* payload = marker.data() + 18;
-    const size_t payload_size = marker.size() - 18;
-    if (index != last_index + 1 || index > total) {
-      return;
-    }
-    if (last_index == 0) {
-      // Look up the offset of the CICP tag from the first chunk of ICC data.
-      if (payload_size < 132) {
-        return;
-      }
-      uint32_t tag_count = LoadBE32(&payload[128]);
-      if (payload_size < 132 + 12 * tag_count) {
-        return;
-      }
-      for (uint32_t i = 0; i < tag_count; ++i) {
-        if (memcmp(&payload[132 + 12 * i], kCICPTagSignature, 4) == 0) {
-          cicp_offset = LoadBE32(&payload[136 + 12 * i]);
-          cicp_length = LoadBE32(&payload[140 + 12 * i]);
-        }
-      }
-      if (cicp_length < kCICPTagSize) {
-        return;
-      }
-    }
-    if (cicp_offset < payload_size) {
-      size_t n_bytes =
-          std::min(payload_size - cicp_offset, kCICPTagSize - cicp_pos);
-      memcpy(&cicp_tag[cicp_pos], &payload[cicp_offset], n_bytes);
-      cicp_pos += n_bytes;
-      if (cicp_pos == kCICPTagSize) {
-        break;
-      }
-      cicp_offset = 0;
-    } else {
-      cicp_offset -= payload_size;
-    }
-    ++last_index;
-  }
-  if (cicp_pos >= kCICPTagSize && memcmp(cicp_tag, kCICPTagSignature, 4) == 0) {
-    *tf = cicp_tag[9];
-  }
-}
 
 float DistanceToLinearQuality(float distance) {
   if (distance <= 0.1f) {
@@ -529,9 +459,30 @@ float DistanceToLinearQuality(float distance) {
   }
 }
 
+float DistanceToScale(float distance, int k) {
+  constexpr float kExponent[DCTSIZE2] = {
+      1.00f, 0.51f, 0.67f, 0.74f, 1.00f, 1.00f, 1.00f, 1.00f,  //
+      0.51f, 0.66f, 0.69f, 0.87f, 1.00f, 1.00f, 1.00f, 1.00f,  //
+      0.67f, 0.69f, 0.84f, 0.83f, 0.96f, 1.00f, 1.00f, 1.00f,  //
+      0.74f, 0.87f, 0.83f, 1.00f, 1.00f, 0.91f, 0.91f, 1.00f,  //
+      1.00f, 1.00f, 0.96f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,  //
+      1.00f, 1.00f, 1.00f, 0.91f, 1.00f, 1.00f, 1.00f, 1.00f,  //
+      1.00f, 1.00f, 1.00f, 0.91f, 1.00f, 1.00f, 1.00f, 1.00f,  //
+      1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,  //
+  };
+  constexpr float kDist0 = 1.5f;  // distance where non-linearity kicks in.
+  if (distance < kDist0) {
+    return distance;
+  }
+  const float exp = kExponent[k];
+  const float mul = std::pow(kDist0, 1.0 - exp);
+  return std::max<float>(0.5f * distance, mul * std::pow(distance, exp));
+}
+
 }  // namespace
 
-void FinalizeQuantMatrices(j_compress_ptr cinfo) {
+void SetQuantMatrices(j_compress_ptr cinfo, float distance,
+                      bool add_two_chroma_tables) {
   jpeg_comp_master* m = cinfo->master;
   const bool xyb = m->xyb_mode && cinfo->jpeg_color_space == JCS_RGB;
 
@@ -540,71 +491,74 @@ void FinalizeQuantMatrices(j_compress_ptr cinfo) {
   constexpr float kGlobalScaleXYB = 1.44563150f;
   constexpr float kGlobalScaleYCbCr = 1.73480749f;
 
-  float ac_scale, dc_scale;
-  const float* base_quant_matrix;
+  float global_scale;
+  bool non_linear_scaling = true;
+  const float* base_quant_matrix[NUM_QUANT_TBLS];
+  int num_base_tables;
 
   if (xyb) {
-    ac_scale = kGlobalScaleXYB * m->distance;
-    dc_scale = kGlobalScaleXYB / InitialQuantDC(m->distance);
-    base_quant_matrix = kBaseQuantMatrixXYB;
-  } else if (cinfo->jpeg_color_space == JCS_YCbCr && !m->use_std_tables &&
-             cinfo->comp_info[0].quant_tbl_no == 0 &&
-             cinfo->comp_info[1].quant_tbl_no == 1 &&
-             cinfo->comp_info[2].quant_tbl_no == 1 &&
-             cinfo->quant_tbl_ptrs[0] == nullptr &&
-             cinfo->quant_tbl_ptrs[1] == nullptr) {
-    // No custom quantization tables were specified, so we set our default
-    // YCbCr quantization tables here. We could not do this earlier in
-    // jpegli_set_defaults() because it may depend on the ICC profile and
-    // pixel values.
-    cinfo->comp_info[2].quant_tbl_no = 2;
-    float global_scale = kGlobalScaleYCbCr;
-    uint8_t cicp_tf;
-    LookupCICPTransferFunction(m->special_markers, &cicp_tf);
-    if (cicp_tf == kTransferFunctionPQ) {
+    global_scale = kGlobalScaleXYB;
+    num_base_tables = 3;
+    base_quant_matrix[0] = kBaseQuantMatrixXYB;
+    base_quant_matrix[1] = kBaseQuantMatrixXYB + DCTSIZE2;
+    base_quant_matrix[2] = kBaseQuantMatrixXYB + 2 * DCTSIZE2;
+  } else if (cinfo->jpeg_color_space == JCS_YCbCr && !m->use_std_tables) {
+    global_scale = kGlobalScaleYCbCr;
+    if (m->cicp_transfer_function == kTransferFunctionPQ) {
       global_scale *= .4f;
-    } else if (cicp_tf == kTransferFunctionHLG) {
+    } else if (m->cicp_transfer_function == kTransferFunctionHLG) {
       global_scale *= .5f;
     }
-    ac_scale = global_scale * m->distance;
-    dc_scale = global_scale / InitialQuantDC(m->distance);
-    base_quant_matrix = kBaseQuantMatrixYCbCr;
+    if (add_two_chroma_tables) {
+      cinfo->comp_info[2].quant_tbl_no = 2;
+      num_base_tables = 3;
+      base_quant_matrix[0] = kBaseQuantMatrixYCbCr;
+      base_quant_matrix[1] = kBaseQuantMatrixYCbCr + DCTSIZE2;
+      base_quant_matrix[2] = kBaseQuantMatrixYCbCr + 2 * DCTSIZE2;
+    } else {
+      num_base_tables = 2;
+      base_quant_matrix[0] = kBaseQuantMatrixYCbCr;
+      // Use the Cr table for both Cb and Cr.
+      base_quant_matrix[1] = kBaseQuantMatrixYCbCr + 2 * DCTSIZE2;
+    }
   } else {
-    dc_scale = ac_scale = 0.01f * DistanceToLinearQuality(m->distance);
-    base_quant_matrix = kBaseQuantMatrixStd;
+    global_scale = 0.01f * DistanceToLinearQuality(distance);
+    non_linear_scaling = false;
+    num_base_tables = 2;
+    base_quant_matrix[0] = kBaseQuantMatrixStd;
+    base_quant_matrix[1] = kBaseQuantMatrixStd + DCTSIZE2;
   }
 
   int quant_max = m->force_baseline ? 255 : 32767U;
-  for (int c = 0; c < cinfo->num_components; ++c) {
-    int quant_idx = cinfo->comp_info[c].quant_tbl_no;
-    if (quant_idx < 0 || quant_idx >= NUM_QUANT_TBLS) {
-      JPEGLI_ERROR("Invalid quant table index %d for component %d", quant_idx,
-                   c);
-    }
+  for (int quant_idx = 0; quant_idx < num_base_tables; ++quant_idx) {
+    const float* base_qm = base_quant_matrix[quant_idx];
     JQUANT_TBL** qtable = &cinfo->quant_tbl_ptrs[quant_idx];
-    if (*qtable != nullptr) {
-      // A custom quantization table was already set for this component, nothing
-      // more to do here.
-      continue;
+    if (*qtable == nullptr) {
+      *qtable = jpegli_alloc_quant_table(reinterpret_cast<j_common_ptr>(cinfo));
     }
-    if (quant_idx > 2) {
-      JPEGLI_ERROR("Missing quantization table %d for component %d", quant_idx,
-                   c);
-    }
-    const float* base_qm = &base_quant_matrix[quant_idx * DCTSIZE2];
-    *qtable = jpegli_alloc_quant_table(reinterpret_cast<j_common_ptr>(cinfo));
     for (int k = 0; k < DCTSIZE2; ++k) {
-      float scale = (k == 0 ? dc_scale : ac_scale);
+      float scale = global_scale;
+      if (non_linear_scaling) {
+        scale *= DistanceToScale(distance, k);
+      }
       int qval = std::round(scale * base_qm[k]);
       (*qtable)->quantval[k] = std::max(1, std::min(qval, quant_max));
     }
     (*qtable)->sent_table = FALSE;
   }
+}
+
+void InitQuantizer(j_compress_ptr cinfo) {
+  jpeg_comp_master* m = cinfo->master;
+  const bool xyb = m->xyb_mode && cinfo->jpeg_color_space == JCS_RGB;
   // Compute quantization multupliers from the quant table values.
   for (int c = 0; c < cinfo->num_components; ++c) {
     int quant_idx = cinfo->comp_info[c].quant_tbl_no;
     JQUANT_TBL* quant_table = cinfo->quant_tbl_ptrs[quant_idx];
-    m->quant_mul[c] = Allocate<float>(cinfo, DCTSIZE2, JPOOL_IMAGE_ALIGNED);
+    if (!quant_table) {
+      JPEGLI_ERROR("Missing quantization table %d for component %d", quant_idx,
+                   c);
+    }
     for (size_t k = 0; k < DCTSIZE2; k++) {
       int val = quant_table->quantval[k];
       if (val == 0) {
@@ -613,8 +567,11 @@ void FinalizeQuantMatrices(j_compress_ptr cinfo) {
       m->quant_mul[c][k] = 8.0f / val;
     }
   }
+  int y_channel = cinfo->jpeg_color_space == JCS_RGB ? 1 : 0;
+  jpeg_component_info* y_comp = &cinfo->comp_info[y_channel];
+  int y_quant_dc = cinfo->quant_tbl_ptrs[y_comp->quant_tbl_no]->quantval[0];
   for (int c = 0; c < cinfo->num_components; ++c) {
-    if (c < 3 && m->distance <= 1.0f) {
+    if (c < 3 && y_quant_dc <= 2) {
       m->zero_bias_mul[c] = xyb ? kZeroBiasMulXYB[c] : kZeroBiasMulYCbCr[c];
     } else {
       m->zero_bias_mul[c] = 0.5f;

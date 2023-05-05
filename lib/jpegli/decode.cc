@@ -16,7 +16,6 @@
 #include "lib/jpegli/error.h"
 #include "lib/jpegli/memory_manager.h"
 #include "lib/jpegli/render.h"
-#include "lib/jpegli/source_manager.h"
 #include "lib/jxl/base/byte_order.h"
 #include "lib/jxl/base/status.h"
 
@@ -36,6 +35,9 @@ void InitializeImage(j_decompress_ptr cinfo) {
   cinfo->marker_list = nullptr;
   cinfo->comp_info = nullptr;
   cinfo->input_scan_number = 0;
+  cinfo->input_iMCU_row = 0;
+  cinfo->output_scan_number = 0;
+  cinfo->output_iMCU_row = 0;
   cinfo->output_scanline = 0;
   cinfo->unread_marker = 0;
   cinfo->coef_bits = nullptr;
@@ -44,15 +46,39 @@ void InitializeImage(j_decompress_ptr cinfo) {
   memset(cinfo->arith_dc_U, 0, sizeof(cinfo->arith_dc_U));
   memset(cinfo->arith_ac_K, 0, sizeof(cinfo->arith_ac_K));
   // Initialize the private fields.
-  cinfo->master->colormap_lut_ = nullptr;
-  cinfo->master->pixels_ = nullptr;
-  cinfo->master->scanlines_ = nullptr;
-  cinfo->master->regenerate_inverse_colormap_ = true;
-  for (int i = 0; i < kMaxComponents; ++i) {
-    cinfo->master->dither_[i] = nullptr;
-    cinfo->master->error_row_[i] = nullptr;
+  jpeg_decomp_master* m = cinfo->master;
+  m->input_buffer_.clear();
+  m->input_buffer_pos_ = 0;
+  m->codestream_bits_ahead_ = 0;
+  m->is_multiscan_ = false;
+  m->found_soi_ = false;
+  m->found_dri_ = false;
+  m->found_sof_ = false;
+  m->found_eoi_ = false;
+  m->icc_index_ = 0;
+  m->icc_total_ = 0;
+  m->icc_profile_.clear();
+  memset(m->dc_huff_lut_, 0, sizeof(m->dc_huff_lut_));
+  memset(m->ac_huff_lut_, 0, sizeof(m->ac_huff_lut_));
+  // Initialize the values to an invalid symbol so that we can recognize it
+  // when reading the bit stream using a Huffman code with space > 0.
+  for (size_t i = 0; i < kAllHuffLutSize; ++i) {
+    m->dc_huff_lut_[i].bits = 0;
+    m->dc_huff_lut_[i].value = 0xffff;
+    m->ac_huff_lut_[i].bits = 0;
+    m->ac_huff_lut_[i].value = 0xffff;
   }
-  cinfo->master->output_passes_done_ = 0;
+  m->colormap_lut_ = nullptr;
+  m->pixels_ = nullptr;
+  m->scanlines_ = nullptr;
+  m->regenerate_inverse_colormap_ = true;
+  for (int i = 0; i < kMaxComponents; ++i) {
+    m->dither_[i] = nullptr;
+    m->error_row_[i] = nullptr;
+  }
+  m->output_passes_done_ = 0;
+  m->xoffset_ = 0;
+  m->dequant_ = nullptr;
 }
 
 void InitializeDecompressParams(j_decompress_ptr cinfo) {
@@ -65,7 +91,7 @@ void InitializeDecompressParams(j_decompress_ptr cinfo) {
   cinfo->raw_data_out = FALSE;
   cinfo->dct_method = JDCT_DEFAULT;
   cinfo->do_fancy_upsampling = TRUE;
-  cinfo->do_block_smoothing = FALSE;
+  cinfo->do_block_smoothing = TRUE;
   cinfo->quantize_colors = FALSE;
   cinfo->dither_mode = JDITHER_FS;
   cinfo->two_pass_quantize = TRUE;
@@ -75,11 +101,6 @@ void InitializeDecompressParams(j_decompress_ptr cinfo) {
   cinfo->enable_2pass_quant = FALSE;
   cinfo->actual_number_of_colors = 0;
   cinfo->colormap = nullptr;
-  // Initialize the private fields.
-  for (int i = 0; i < 16; ++i) {
-    cinfo->master->app_marker_parsers[i] = nullptr;
-  }
-  cinfo->master->com_marker_parser = nullptr;
 }
 
 void InitProgressMonitor(j_decompress_ptr cinfo, bool coef_only) {
@@ -133,47 +154,229 @@ void ProgressMonitorOutputPass(j_decompress_ptr cinfo) {
   (*cinfo->progress->progress_monitor)(reinterpret_cast<j_common_ptr>(cinfo));
 }
 
+void BuildHuffmanLookupTable(j_decompress_ptr cinfo, JHUFF_TBL* table,
+                             HuffmanTableEntry* huff_lut) {
+  uint32_t counts[kJpegHuffmanMaxBitLength + 1] = {};
+  counts[0] = 0;
+  int total_count = 0;
+  int space = 1 << kJpegHuffmanMaxBitLength;
+  int max_depth = 1;
+  for (size_t i = 1; i <= kJpegHuffmanMaxBitLength; ++i) {
+    int count = table->bits[i];
+    if (count != 0) {
+      max_depth = i;
+    }
+    counts[i] = count;
+    total_count += count;
+    space -= count * (1 << (kJpegHuffmanMaxBitLength - i));
+  }
+  uint32_t values[kJpegHuffmanAlphabetSize + 1] = {};
+  uint8_t values_seen[256] = {0};
+  for (int i = 0; i < total_count; ++i) {
+    int value = table->huffval[i];
+    if (values_seen[value]) {
+      return JPEGLI_ERROR("Duplicate Huffman code value %d", value);
+    }
+    values_seen[value] = 1;
+    values[i] = value;
+  }
+  // Add an invalid symbol that will have the all 1 code.
+  ++counts[max_depth];
+  values[total_count] = kJpegHuffmanAlphabetSize;
+  space -= (1 << (kJpegHuffmanMaxBitLength - max_depth));
+  if (space < 0) {
+    JPEGLI_ERROR("Invalid Huffman code lengths.");
+  } else if (space > 0 && huff_lut[0].value != 0xffff) {
+    // Re-initialize the values to an invalid symbol so that we can recognize
+    // it when reading the bit stream using a Huffman code with space > 0.
+    for (int i = 0; i < kJpegHuffmanLutSize; ++i) {
+      huff_lut[i].bits = 0;
+      huff_lut[i].value = 0xffff;
+    }
+  }
+  BuildJpegHuffmanTable(&counts[0], &values[0], huff_lut);
+}
+
+void PrepareForScan(j_decompress_ptr cinfo) {
+  jpeg_decomp_master* m = cinfo->master;
+  for (int i = 0; i < cinfo->comps_in_scan; ++i) {
+    int comp_idx = cinfo->cur_comp_info[i]->component_index;
+    int* prev_coef_bits = cinfo->coef_bits[comp_idx + cinfo->num_components];
+    for (int k = std::min(cinfo->Ss, 1); k <= std::max(cinfo->Se, 9); k++) {
+      prev_coef_bits[k] =
+          (cinfo->input_scan_number > 0) ? cinfo->coef_bits[comp_idx][k] : 0;
+    }
+    for (int k = cinfo->Ss; k <= cinfo->Se; ++k) {
+      cinfo->coef_bits[comp_idx][k] = cinfo->Al;
+    }
+  }
+  AddStandardHuffmanTables(reinterpret_cast<j_common_ptr>(cinfo),
+                           /*is_dc=*/false);
+  AddStandardHuffmanTables(reinterpret_cast<j_common_ptr>(cinfo),
+                           /*is_dc=*/true);
+  // Check that all the Huffman tables needed for this scan are defined and
+  // build derived lookup tables.
+  for (int i = 0; i < cinfo->comps_in_scan; ++i) {
+    if (cinfo->Ss == 0) {
+      int dc_tbl_idx = cinfo->cur_comp_info[i]->dc_tbl_no;
+      JHUFF_TBL* table = cinfo->dc_huff_tbl_ptrs[dc_tbl_idx];
+      HuffmanTableEntry* huff_lut =
+          &m->dc_huff_lut_[dc_tbl_idx * kJpegHuffmanLutSize];
+      if (!table) {
+        return JPEGLI_ERROR("DC Huffman table %d not found", dc_tbl_idx);
+      }
+      BuildHuffmanLookupTable(cinfo, table, huff_lut);
+    }
+    if (cinfo->Se > 0) {
+      int ac_tbl_idx = cinfo->cur_comp_info[i]->ac_tbl_no;
+      JHUFF_TBL* table = cinfo->ac_huff_tbl_ptrs[ac_tbl_idx];
+      HuffmanTableEntry* huff_lut =
+          &m->ac_huff_lut_[ac_tbl_idx * kJpegHuffmanLutSize];
+      if (!table) {
+        return JPEGLI_ERROR("AC Huffman table %d not found", ac_tbl_idx);
+      }
+      BuildHuffmanLookupTable(cinfo, table, huff_lut);
+    }
+  }
+  // Copy quantization tables into comp_info.
+  for (int i = 0; i < cinfo->comps_in_scan; ++i) {
+    jpeg_component_info* comp = cinfo->cur_comp_info[i];
+    if (comp->quant_table == nullptr) {
+      comp->quant_table = Allocate<JQUANT_TBL>(cinfo, 1, JPOOL_IMAGE);
+      memcpy(comp->quant_table, cinfo->quant_tbl_ptrs[comp->quant_tbl_no],
+             sizeof(JQUANT_TBL));
+    }
+  }
+  if (cinfo->comps_in_scan == 1) {
+    const auto& comp = *cinfo->cur_comp_info[0];
+    cinfo->MCUs_per_row = DivCeil(cinfo->image_width * comp.h_samp_factor,
+                                  cinfo->max_h_samp_factor * DCTSIZE);
+    cinfo->MCU_rows_in_scan = DivCeil(cinfo->image_height * comp.v_samp_factor,
+                                      cinfo->max_v_samp_factor * DCTSIZE);
+    m->mcu_rows_per_iMCU_row_ = cinfo->cur_comp_info[0]->v_samp_factor;
+  } else {
+    cinfo->MCU_rows_in_scan = cinfo->total_iMCU_rows;
+    cinfo->MCUs_per_row = m->iMCU_cols_;
+    m->mcu_rows_per_iMCU_row_ = 1;
+    size_t mcu_size = 0;
+    for (int i = 0; i < cinfo->comps_in_scan; ++i) {
+      jpeg_component_info* comp = cinfo->cur_comp_info[i];
+      mcu_size += comp->h_samp_factor * comp->v_samp_factor;
+    }
+    if (mcu_size > D_MAX_BLOCKS_IN_MCU) {
+      JPEGLI_ERROR("MCU size too big");
+    }
+  }
+  memset(m->last_dc_coeff_, 0, sizeof(m->last_dc_coeff_));
+  m->restarts_to_go_ = cinfo->restart_interval;
+  m->next_restart_marker_ = 0;
+  m->eobrun_ = -1;
+  m->scan_mcu_row_ = 0;
+  m->scan_mcu_col_ = 0;
+  m->codestream_bits_ahead_ = 0;
+  ++cinfo->input_scan_number;
+  cinfo->input_iMCU_row = 0;
+  PrepareForiMCURow(cinfo);
+  cinfo->global_state = kDecProcessScan;
+}
+
 int ConsumeInput(j_decompress_ptr cinfo) {
+  jpeg_decomp_master* m = cinfo->master;
+  if (cinfo->global_state == kDecProcessScan && m->streaming_mode_ &&
+      cinfo->input_iMCU_row > cinfo->output_iMCU_row) {
+    // Prevent input from getting ahead of output in streaming mode.
+    return JPEG_SUSPENDED;
+  }
   jpeg_source_mgr* src = cinfo->src;
-  std::vector<uint8_t> buffer;
-  const uint8_t* last_input_byte = src->next_input_byte + src->bytes_in_buffer;
   int status;
   for (;;) {
-    if (cinfo->global_state == kDecProcessScan) {
-      status = ProcessScan(cinfo);
+    const uint8_t* data;
+    size_t len;
+    if (m->input_buffer_.empty()) {
+      data = cinfo->src->next_input_byte;
+      len = cinfo->src->bytes_in_buffer;
     } else {
-      status = ProcessMarkers(cinfo);
+      data = &m->input_buffer_[m->input_buffer_pos_];
+      len = m->input_buffer_.size() - m->input_buffer_pos_;
     }
-    if (status != JPEG_SUSPENDED) {
+    size_t pos = 0;
+    if (cinfo->global_state == kDecProcessScan) {
+      status = ProcessScan(cinfo, data, len, &pos, &m->codestream_bits_ahead_);
+    } else {
+      status = ProcessMarkers(cinfo, data, len, &pos);
+    }
+    if (m->input_buffer_.empty()) {
+      cinfo->src->next_input_byte += pos;
+      cinfo->src->bytes_in_buffer -= pos;
+    } else {
+      m->input_buffer_pos_ += pos;
+      size_t bytes_left = m->input_buffer_.size() - m->input_buffer_pos_;
+      if (bytes_left <= src->bytes_in_buffer) {
+        src->next_input_byte += (src->bytes_in_buffer - bytes_left);
+        src->bytes_in_buffer = bytes_left;
+        m->input_buffer_.clear();
+        m->input_buffer_pos_ = 0;
+      }
+    }
+    if (status == kHandleRestart) {
+      JXL_DASSERT(m->input_buffer_.size() <=
+                  m->input_buffer_pos_ + src->bytes_in_buffer);
+      m->input_buffer_.clear();
+      m->input_buffer_pos_ = 0;
+      if (cinfo->unread_marker == 0xd0 + m->next_restart_marker_) {
+        cinfo->unread_marker = 0;
+      } else {
+        if (!(*cinfo->src->resync_to_restart)(cinfo, m->next_restart_marker_)) {
+          return JPEG_SUSPENDED;
+        }
+      }
+      m->next_restart_marker_ += 1;
+      m->next_restart_marker_ &= 0x7;
+      m->restarts_to_go_ = cinfo->restart_interval;
+      if (cinfo->unread_marker != 0) {
+        JPEGLI_WARN("Failed to resync to next restart marker, skipping scan.");
+        return JPEG_SCAN_COMPLETED;
+      }
+      continue;
+    }
+    if (status == kHandleMarkerProcessor) {
+      JXL_DASSERT(m->input_buffer_.size() <=
+                  m->input_buffer_pos_ + src->bytes_in_buffer);
+      m->input_buffer_.clear();
+      m->input_buffer_pos_ = 0;
+      if (!(*GetMarkerProcessor(cinfo))(cinfo)) {
+        return JPEG_SUSPENDED;
+      }
+      cinfo->unread_marker = 0;
+      continue;
+    }
+    if (status != kNeedMoreInput) {
       break;
     }
-    if (buffer.size() != src->bytes_in_buffer) {
-      // Save the unprocessed bytes in the input to a temporary buffer.
-      buffer.assign(src->next_input_byte,
-                    src->next_input_byte + src->bytes_in_buffer);
+    if (m->input_buffer_.empty()) {
+      JXL_DASSERT(m->input_buffer_pos_ == 0);
+      m->input_buffer_.assign(src->next_input_byte,
+                              src->next_input_byte + src->bytes_in_buffer);
     }
     if (!(*cinfo->src->fill_input_buffer)(cinfo)) {
-      return status;
+      m->input_buffer_.clear();
+      m->input_buffer_pos_ = 0;
+      return JPEG_SUSPENDED;
     }
     if (src->bytes_in_buffer == 0) {
       JPEGLI_ERROR("Empty input.");
     }
-    // Save the end of the current input so that we can restore it after the
-    // input processing succeeds.
-    last_input_byte = cinfo->src->next_input_byte + src->bytes_in_buffer;
-    // Extend the temporary buffer with the new bytes and point the input to it.
-    buffer.insert(buffer.end(), src->next_input_byte, last_input_byte);
-    src->next_input_byte = buffer.data();
-    src->bytes_in_buffer = buffer.size();
+    m->input_buffer_.insert(m->input_buffer_.end(), src->next_input_byte,
+                            src->next_input_byte + src->bytes_in_buffer);
   }
-  // Restore the input pointer in case we had to change it to a temporary
-  // buffer earlier.
-  src->next_input_byte = last_input_byte - src->bytes_in_buffer;
   if (status == JPEG_SCAN_COMPLETED) {
     cinfo->global_state = kDecProcessMarkers;
   } else if (status == JPEG_REACHED_SOS) {
-    cinfo->global_state =
-        cinfo->global_state == kDecInHeader ? kDecHeaderDone : kDecProcessScan;
+    if (cinfo->global_state == kDecInHeader) {
+      cinfo->global_state = kDecHeaderDone;
+    } else {
+      PrepareForScan(cinfo);
+    }
   }
   return status;
 }
@@ -191,7 +394,8 @@ bool IsInputReady(j_decompress_ptr cinfo) {
   if (cinfo->input_iMCU_row == cinfo->total_iMCU_rows) {
     return true;
   }
-  return cinfo->input_iMCU_row > cinfo->output_iMCU_row;
+  return cinfo->input_iMCU_row >
+         cinfo->output_iMCU_row + (cinfo->master->streaming_mode_ ? 0 : 2);
 }
 
 bool ReadOutputPass(j_decompress_ptr cinfo) {
@@ -235,8 +439,14 @@ boolean PrepareQuantizedOutput(j_decompress_ptr cinfo) {
     cinfo->dither_mode = JDITHER_FS;
   }
   if (m->quant_mode_ == 1) {
+    if (!cinfo->enable_1pass_quant) {
+      JPEGLI_ERROR("1-pass quantizer was not enabled");
+    }
     ChooseColorMap1Pass(cinfo);
   } else if (m->quant_mode_ == 2) {
+    if (!cinfo->enable_2pass_quant) {
+      JPEGLI_ERROR("2-pass quantizer was not enabled");
+    }
     m->quant_pass_ = 0;
     if (!ReadOutputPass(cinfo)) {
       return FALSE;
@@ -254,6 +464,23 @@ boolean PrepareQuantizedOutput(j_decompress_ptr cinfo) {
   }
   m->quant_pass_ = 1;
   return TRUE;
+}
+
+void AllocateCoefficientBuffer(j_decompress_ptr cinfo) {
+  jpeg_decomp_master* m = cinfo->master;
+  j_common_ptr comptr = reinterpret_cast<j_common_ptr>(cinfo);
+  jvirt_barray_ptr* coef_arrays = jpegli::Allocate<jvirt_barray_ptr>(
+      cinfo, cinfo->num_components, JPOOL_IMAGE);
+  for (int c = 0; c < cinfo->num_components; ++c) {
+    jpeg_component_info* comp = &cinfo->comp_info[c];
+    size_t height_in_blocks =
+        m->streaming_mode_ ? comp->v_samp_factor : comp->height_in_blocks;
+    coef_arrays[c] = (*cinfo->mem->request_virt_barray)(
+        comptr, JPOOL_IMAGE, TRUE, comp->width_in_blocks, height_in_blocks,
+        comp->v_samp_factor);
+  }
+  cinfo->master->coef_arrays = coef_arrays;
+  (*cinfo->mem->realize_virt_arrays)(comptr);
 }
 
 }  // namespace jpegli
@@ -279,6 +506,12 @@ void jpegli_CreateDecompress(j_decompress_ptr cinfo, int version,
   cinfo->sample_range_limit = nullptr;  // not used
   cinfo->rec_outbuf_height = 1;         // output works with any buffer height
   cinfo->master = new jpeg_decomp_master;
+  jpeg_decomp_master* m = cinfo->master;
+  for (int i = 0; i < 16; ++i) {
+    m->app_marker_parsers[i] = nullptr;
+  }
+  m->com_marker_parser = nullptr;
+  memset(m->markers_to_save_, 0, sizeof(m->markers_to_save_));
   jpegli::InitializeDecompressParams(cinfo);
   jpegli::InitializeImage(cinfo);
 }
@@ -293,8 +526,12 @@ void jpegli_abort_decompress(j_decompress_ptr cinfo) {
 
 void jpegli_save_markers(j_decompress_ptr cinfo, int marker_code,
                          unsigned int length_limit) {
+  // TODO(szabadka) Limit our memory usage by taking into account length_limit.
   jpeg_decomp_master* m = cinfo->master;
-  m->markers_to_save_.insert(marker_code);
+  if (marker_code < 0xe0) {
+    JPEGLI_ERROR("jpegli_save_markers: invalid marker code %d", marker_code);
+  }
+  m->markers_to_save_[marker_code - 0xe0] = 1;
 }
 
 void jpegli_set_marker_processor(j_decompress_ptr cinfo, int marker_code,
@@ -314,6 +551,7 @@ int jpegli_consume_input(j_decompress_ptr cinfo) {
   if (cinfo->global_state == jpegli::kDecStart) {
     (*cinfo->err->reset_error_mgr)(reinterpret_cast<j_common_ptr>(cinfo));
     (*cinfo->src->init_source)(cinfo);
+    jpegli::InitializeDecompressParams(cinfo);
     jpegli::InitializeImage(cinfo);
     cinfo->global_state = jpegli::kDecInHeader;
   }
@@ -338,6 +576,9 @@ int jpegli_read_header(j_decompress_ptr cinfo, boolean require_image) {
     JPEGLI_ERROR("jpegli_read_header: unexpected state %d",
                  cinfo->global_state);
   }
+  if (cinfo->src == nullptr) {
+    JPEGLI_ERROR("Missing source.");
+  }
   for (;;) {
     int retcode = jpegli_consume_input(cinfo);
     if (retcode == JPEG_SUSPENDED) {
@@ -345,7 +586,11 @@ int jpegli_read_header(j_decompress_ptr cinfo, boolean require_image) {
     } else if (retcode == JPEG_REACHED_SOS) {
       break;
     } else if (retcode == JPEG_REACHED_EOI) {
-      JPEGLI_ERROR("jpegli_read_header: unexpected EOI marker.");
+      if (require_image) {
+        JPEGLI_ERROR("jpegli_read_header: unexpected EOI marker.");
+      }
+      jpegli_abort_decompress(cinfo);
+      return JPEG_HEADER_TABLES_ONLY;
     }
   };
   return JPEG_HEADER_OK;
@@ -419,6 +664,17 @@ void jpegli_calc_output_dimensions(j_decompress_ptr cinfo) {
       m->scaled_dct_size[c] = DCTSIZE;
     }
   }
+  if (cinfo->out_color_space == JCS_GRAYSCALE) {
+    cinfo->out_color_components = 1;
+  } else if (cinfo->out_color_space == JCS_RGB ||
+             cinfo->out_color_space == JCS_YCbCr) {
+    cinfo->out_color_components = 3;
+  } else if (cinfo->out_color_space == JCS_CMYK ||
+             cinfo->out_color_space == JCS_YCCK) {
+    cinfo->out_color_components = 4;
+  } else {
+    cinfo->out_color_components = cinfo->num_components;
+  }
   cinfo->output_components =
       cinfo->quantize_colors ? 1 : cinfo->out_color_components;
   cinfo->rec_outbuf_height = 1;
@@ -436,28 +692,41 @@ boolean jpegli_input_complete(j_decompress_ptr cinfo) {
 }
 
 boolean jpegli_start_decompress(j_decompress_ptr cinfo) {
+  jpeg_decomp_master* m = cinfo->master;
   if (cinfo->global_state == jpegli::kDecHeaderDone) {
+    m->streaming_mode_ = !m->is_multiscan_ && !cinfo->buffered_image &&
+                         (!cinfo->quantize_colors || !cinfo->two_pass_quantize);
+    jpegli::AllocateCoefficientBuffer(cinfo);
     jpegli_calc_output_dimensions(cinfo);
-    cinfo->global_state = jpegli::kDecProcessScan;
+    jpegli::PrepareForScan(cinfo);
+    if (cinfo->quantize_colors) {
+      if (cinfo->colormap != nullptr) {
+        cinfo->enable_external_quant = TRUE;
+      } else if (cinfo->two_pass_quantize &&
+                 cinfo->out_color_space == JCS_RGB) {
+        cinfo->enable_2pass_quant = TRUE;
+      } else {
+        cinfo->enable_1pass_quant = TRUE;
+      }
+    }
     jpegli::InitProgressMonitor(cinfo, /*coef_only=*/false);
     if (cinfo->buffered_image == TRUE) {
       cinfo->output_scan_number = 0;
       return TRUE;
     }
-  } else if (!cinfo->master->is_multiscan_) {
+  } else if (!m->is_multiscan_) {
     JPEGLI_ERROR("jpegli_start_decompress: unexpected state %d",
                  cinfo->global_state);
   }
-  if (cinfo->master->is_multiscan_) {
+  if (m->is_multiscan_) {
     if (cinfo->global_state != jpegli::kDecProcessScan &&
         cinfo->global_state != jpegli::kDecProcessMarkers) {
       JPEGLI_ERROR("jpegli_start_decompress: unexpected state %d",
                    cinfo->global_state);
     }
-    while (!cinfo->master->found_eoi_) {
+    while (!m->found_eoi_) {
       jpegli::ProgressMonitorInputPass(cinfo);
-      int retcode = jpegli::ConsumeInput(cinfo);
-      if (retcode == JPEG_SUSPENDED) {
+      if (jpegli::ConsumeInput(cinfo) == JPEG_SUSPENDED) {
         return FALSE;
       }
     }
@@ -606,9 +875,12 @@ JDIMENSION jpegli_read_raw_data(j_decompress_ptr cinfo, JSAMPIMAGE data,
 
 jvirt_barray_ptr* jpegli_read_coefficients(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
+  m->streaming_mode_ = false;
   if (!cinfo->buffered_image && cinfo->global_state == jpegli::kDecHeaderDone) {
+    jpegli::AllocateCoefficientBuffer(cinfo);
+    jpegli_calc_output_dimensions(cinfo);
     jpegli::InitProgressMonitor(cinfo, /*coef_only=*/true);
-    cinfo->global_state = jpegli::kDecProcessScan;
+    jpegli::PrepareForScan(cinfo);
   }
   if (cinfo->global_state != jpegli::kDecProcessScan &&
       cinfo->global_state != jpegli::kDecProcessMarkers) {
@@ -618,33 +890,13 @@ jvirt_barray_ptr* jpegli_read_coefficients(j_decompress_ptr cinfo) {
   if (!cinfo->buffered_image) {
     while (!m->found_eoi_) {
       jpegli::ProgressMonitorInputPass(cinfo);
-      int retcode = jpegli::ConsumeInput(cinfo);
-      if (retcode == JPEG_SUSPENDED) {
+      if (jpegli::ConsumeInput(cinfo) == JPEG_SUSPENDED) {
         return nullptr;
       }
     }
+    cinfo->output_scanline = cinfo->output_height;
   }
-  j_common_ptr comptr = reinterpret_cast<j_common_ptr>(cinfo);
-  jvirt_barray_ptr* coef_arrays = jpegli::Allocate<jvirt_barray_ptr>(
-      cinfo, cinfo->num_components, JPOOL_IMAGE);
-  for (int c = 0; c < cinfo->num_components; ++c) {
-    size_t xsize_blocks = cinfo->comp_info[c].width_in_blocks;
-    size_t ysize_blocks = cinfo->comp_info[c].height_in_blocks;
-    coef_arrays[c] = (*cinfo->mem->request_virt_barray)(
-        comptr, JPOOL_IMAGE, FALSE, xsize_blocks, ysize_blocks, 1);
-  }
-  (*cinfo->mem->realize_virt_arrays)(comptr);
-  for (int c = 0; c < cinfo->num_components; ++c) {
-    jpeg_component_info* comp = &cinfo->comp_info[c];
-    for (size_t by = 0; by < comp->height_in_blocks; ++by) {
-      JBLOCKARRAY ba = (*cinfo->mem->access_virt_barray)(comptr, coef_arrays[c],
-                                                         by, 1, true);
-      size_t stride = comp->width_in_blocks * sizeof(JBLOCK);
-      size_t offset = by * comp->width_in_blocks * DCTSIZE2;
-      memcpy(ba[0], &m->components_[c].coeffs[offset], stride);
-    }
-  }
-  return coef_arrays;
+  return m->coef_arrays;
 }
 
 boolean jpegli_finish_decompress(j_decompress_ptr cinfo) {
@@ -653,9 +905,11 @@ boolean jpegli_finish_decompress(j_decompress_ptr cinfo) {
     JPEGLI_ERROR("jpegli_finish_decompress: unexpected state %d",
                  cinfo->global_state);
   }
+  if (!cinfo->buffered_image && cinfo->output_scanline < cinfo->output_height) {
+    JPEGLI_ERROR("Incomplete output");
+  }
   while (!cinfo->master->found_eoi_) {
-    int retcode = jpegli::ConsumeInput(cinfo);
-    if (retcode == JPEG_SUSPENDED) {
+    if (jpegli::ConsumeInput(cinfo) == JPEG_SUSPENDED) {
       return FALSE;
     }
   }
@@ -665,8 +919,10 @@ boolean jpegli_finish_decompress(j_decompress_ptr cinfo) {
 }
 
 boolean jpegli_resync_to_restart(j_decompress_ptr cinfo, int desired) {
-  // The default resync_to_restart will just throw an error.
-  JPEGLI_ERROR("Invalid restart marker found.");
+  JPEGLI_WARN("Invalid restart marker found: 0x%02x vs 0x%02x.",
+              cinfo->unread_marker, 0xd0 + desired);
+  // This is a trivial implementation, we just let the decoder skip the entire
+  // scan and attempt to render the partial input.
   return TRUE;
 }
 
@@ -680,7 +936,7 @@ void jpegli_new_colormap(j_decompress_ptr cinfo) {
     JPEGLI_ERROR("jpegli_new_colormap: not in  buffered image mode");
   }
   if (!cinfo->enable_external_quant) {
-    JPEGLI_ERROR("external quantization was not enabled");
+    JPEGLI_ERROR("external colormap quantizer was not enabled");
   }
   if (!cinfo->quantize_colors || cinfo->colormap == nullptr) {
     JPEGLI_ERROR("jpegli_new_colormap: not in external colormap mode");
@@ -690,8 +946,26 @@ void jpegli_new_colormap(j_decompress_ptr cinfo) {
 
 void jpegli_set_output_format(j_decompress_ptr cinfo, JpegliDataType data_type,
                               JpegliEndianness endianness) {
-  cinfo->master->output_data_type_ = data_type;
-  cinfo->master->swap_endianness_ =
-      ((endianness == JPEGLI_BIG_ENDIAN && IsLittleEndian()) ||
-       (endianness == JPEGLI_LITTLE_ENDIAN && !IsLittleEndian()));
+  switch (data_type) {
+    case JPEGLI_TYPE_UINT8:
+    case JPEGLI_TYPE_UINT16:
+    case JPEGLI_TYPE_FLOAT:
+      cinfo->master->output_data_type_ = data_type;
+      break;
+    default:
+      JPEGLI_ERROR("Unsupported data type %d", data_type);
+  }
+  switch (endianness) {
+    case JPEGLI_NATIVE_ENDIAN:
+      cinfo->master->swap_endianness_ = false;
+      break;
+    case JPEGLI_LITTLE_ENDIAN:
+      cinfo->master->swap_endianness_ = !IsLittleEndian();
+      break;
+    case JPEGLI_BIG_ENDIAN:
+      cinfo->master->swap_endianness_ = IsLittleEndian();
+      break;
+    default:
+      JPEGLI_ERROR("Unsupported endianness %d", endianness);
+  }
 }
