@@ -3,14 +3,17 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 
 #include "lib/extras/codec.h"
-#include "lib/jxl/image_metadata.h"
-#include "tools/args.h"
+#include "lib/extras/packed_image_convert.h"
 #include "tools/cmdline.h"
+#include "tools/file_io.h"
+#include "tools/no_memory_manager.h"
 #include "tools/thread_pool_internal.h"
+
+using jxl::Image3F;
 
 int main(int argc, const char** argv) {
   jpegxl::tools::ThreadPoolInternal pool;
@@ -38,24 +41,31 @@ int main(int argc, const char** argv) {
     return EXIT_FAILURE;
   }
 
-  jxl::Image3F image(N * N, N);
+  JXL_ASSIGN_OR_RETURN(
+      Image3F image,
+      Image3F::Create(jpegxl::tools::NoMemoryManager(), N * N, N));
+  const float scale = 1.0 / (N - 1);
   JXL_CHECK(jxl::RunOnPool(
-      &pool, 0, N, jxl::ThreadPool::NoInit,
+      pool.get(), 0, N, jxl::ThreadPool::NoInit,
       [&](const uint32_t y, size_t /* thread */) {
-        const float g = static_cast<float>(y) / (N - 1);
+        const float g = y * scale;
         float* const JXL_RESTRICT rows[3] = {
             image.PlaneRow(0, y), image.PlaneRow(1, y), image.PlaneRow(2, y)};
         for (size_t x = 0; x < N * N; ++x) {
-          rows[0][x] = static_cast<float>(x % N) / (N - 1);
+          size_t r = x % N;
+          size_t q = x / N;
+          rows[0][x] = r * scale;
           rows[1][x] = g;
-          rows[2][x] = static_cast<float>(x / N) / (N - 1);
+          rows[2][x] = q * scale;
         }
       },
       "GenerateTemplate"));
 
-  jxl::CodecInOut output;
-  output.metadata.m.bit_depth.bits_per_sample = 16;
-  output.SetFromImage(std::move(image), jxl::ColorEncoding::SRGB());
-  JXL_CHECK(jxl::EncodeToFile(output, jxl::ColorEncoding::SRGB(), 16,
-                              output_filename, &pool));
+  JxlPixelFormat format = {3, JXL_TYPE_UINT16, JXL_BIG_ENDIAN, 0};
+  jxl::extras::PackedPixelFile ppf =
+      jxl::extras::ConvertImage3FToPackedPixelFile(
+          image, jxl::ColorEncoding::SRGB(), format, pool.get());
+  std::vector<uint8_t> encoded;
+  JXL_CHECK(jxl::Encode(ppf, output_filename, &encoded, pool.get()));
+  JXL_CHECK(jpegxl::tools::WriteFile(output_filename, encoded));
 }

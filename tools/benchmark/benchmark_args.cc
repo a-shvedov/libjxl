@@ -5,24 +5,25 @@
 
 #include "tools/benchmark/benchmark_args.h"
 
-#include <stddef.h>
-#include <stdlib.h>
+#include <jxl/color_encoding.h>
 
-#include <algorithm>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
-#include "lib/extras/codec.h"
 #include "lib/extras/dec/color_description.h"
+#include "lib/extras/dec/decode.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/color_encoding_internal.h"
-#include "lib/jxl/color_management.h"
 #include "tools/benchmark/benchmark_codec_custom.h"  // for AddCommand..
-#include "tools/benchmark/benchmark_codec_jpeg.h"  // for AddCommand..
+#include "tools/benchmark/benchmark_codec_jpeg.h"    // for AddCommand..
 #include "tools/benchmark/benchmark_codec_jxl.h"
-#if JPEGXL_ENABLE_APNG
+
+#ifdef BENCHMARK_PNG
 #include "tools/benchmark/benchmark_codec_png.h"
-#endif
+#endif  // BENCHMARK_PNG
 
 #ifdef BENCHMARK_WEBP
 #include "tools/benchmark/benchmark_codec_webp.h"
@@ -194,8 +195,6 @@ Status BenchmarkArgs::AddCommandLineOptions() {
   AddDouble(&error_pnorm, "error_pnorm",
             "smallest p norm for pooling butteraugli values", 3.0);
 
-  AddFlag(&profiler, "profiler", "If true, print profiler results.", false);
-
   AddFlag(&show_progress, "show_progress",
           "Show activity dots per completed file during benchmark.", false);
 
@@ -213,14 +212,20 @@ Status BenchmarkArgs::AddCommandLineOptions() {
       "Distance numbers and compression speeds shown in the table are invalid.",
       false);
 
+  AddUnsigned(
+      &generations, "generations",
+      "If nonzero, enables generation loss testing with this number of "
+      "intermediate generations. "
+      "That is, the decoded image gets re-encoded, iteratively, N times.",
+      0);
+
   if (!AddCommandLineOptionsCustomCodec(this)) return false;
   if (!AddCommandLineOptionsJxlCodec(this)) return false;
-#ifdef BENCHMARK_JPEG
   if (!AddCommandLineOptionsJPEGCodec(this)) return false;
-#endif  // BENCHMARK_JPEG
-#if JPEGXL_ENABLE_APNG
+
+#ifdef BENCHMARK_PNG
   if (!AddCommandLineOptionsPNGCodec(this)) return false;
-#endif
+#endif  // BENCHMARK_PNG
 #ifdef BENCHMARK_WEBP
   if (!AddCommandLineOptionsWebPCodec(this)) return false;
 #endif  // BENCHMARK_WEBP
@@ -232,12 +237,11 @@ Status BenchmarkArgs::AddCommandLineOptions() {
 }
 
 Status BenchmarkArgs::ValidateArgs() {
-  size_t bits_per_sample = 0;  // unused
   if (input.empty()) {
     fprintf(stderr, "Missing --input filename(s).\n");
     return false;
   }
-  if (jxl::extras::CodecFromExtension(output_extension, &bits_per_sample) ==
+  if (jxl::extras::CodecFromPath(output_extension) ==
       jxl::extras::Codec::kUnknown) {
     JXL_WARNING("Unrecognized output_extension %s, try .png",
                 output_extension.c_str());
@@ -254,9 +258,8 @@ Status BenchmarkArgs::ValidateArgs() {
                   output_description.c_str());
       return false;  // already warned
     }
-    JXL_RETURN_IF_ERROR(jxl::ConvertExternalToInternalColorEncoding(
-        output_encoding_external, &output_encoding));
-    JXL_RETURN_IF_ERROR(output_encoding.CreateICC());
+    JXL_RETURN_IF_ERROR(output_encoding.FromExternal(output_encoding_external));
+    JXL_RETURN_IF_ERROR(!output_encoding.ICC().empty());
   }
 
   JXL_RETURN_IF_ERROR(ValidateArgsJxlCodec(this));

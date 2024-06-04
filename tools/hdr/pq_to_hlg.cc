@@ -3,16 +3,18 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 #include "lib/extras/codec.h"
 #include "lib/extras/hlg.h"
 #include "lib/extras/tone_mapping.h"
-#include "lib/jxl/enc_color_management.h"
-#include "tools/args.h"
 #include "tools/cmdline.h"
+#include "tools/file_io.h"
 #include "tools/hdr/image_utils.h"
+#include "tools/no_memory_manager.h"
 #include "tools/thread_pool_internal.h"
 
 int main(int argc, const char** argv) {
@@ -54,17 +56,21 @@ int main(int argc, const char** argv) {
     return EXIT_FAILURE;
   }
 
-  jxl::CodecInOut image;
+  jxl::CodecInOut image{jpegxl::tools::NoMemoryManager()};
   jxl::extras::ColorHints color_hints;
   color_hints.Add("color_space", "RGB_D65_202_Rel_PeQ");
-  JXL_CHECK(jxl::SetFromFile(input_filename, color_hints, &image, &pool));
+  std::vector<uint8_t> encoded;
+  JXL_CHECK(jpegxl::tools::ReadFile(input_filename, &encoded));
+  JXL_CHECK(
+      jxl::SetFromBytes(jxl::Bytes(encoded), color_hints, &image, pool.get()));
   if (max_nits > 0) {
     image.metadata.m.SetIntensityTarget(max_nits);
   }
-  const jxl::Primaries original_primaries = image.Main().c_current().primaries;
-  JXL_CHECK(jxl::ToneMapTo({0, 1000}, &image, &pool));
-  JXL_CHECK(jxl::HlgInverseOOTF(&image.Main(), 1.2f, &pool));
-  JXL_CHECK(jxl::GamutMap(&image, preserve_saturation, &pool));
+  const jxl::Primaries original_primaries =
+      image.Main().c_current().GetPrimariesType();
+  JXL_CHECK(jxl::ToneMapTo({0, 1000}, &image, pool.get()));
+  JXL_CHECK(jxl::HlgInverseOOTF(&image.Main(), 1.2f, pool.get()));
+  JXL_CHECK(jxl::GamutMap(&image, preserve_saturation, pool.get()));
   // Peak luminance at which the system gamma is 1, since we are now in scene
   // light, having applied the inverse OOTF ourselves to control the subsequent
   // gamut mapping instead of leaving it to JxlCms below.
@@ -72,11 +78,13 @@ int main(int argc, const char** argv) {
 
   jxl::ColorEncoding hlg;
   hlg.SetColorSpace(jxl::ColorSpace::kRGB);
-  hlg.primaries = original_primaries;
-  hlg.white_point = jxl::WhitePoint::kD65;
-  hlg.tf.SetTransferFunction(jxl::TransferFunction::kHLG);
+  JXL_CHECK(hlg.SetPrimariesType(original_primaries));
+  JXL_CHECK(hlg.SetWhitePointType(jxl::WhitePoint::kD65));
+  hlg.Tf().SetTransferFunction(jxl::TransferFunction::kHLG);
   JXL_CHECK(hlg.CreateICC());
-  JXL_CHECK(jpegxl::tools::TransformCodecInOutTo(image, hlg, &pool));
+  JXL_CHECK(jpegxl::tools::TransformCodecInOutTo(image, hlg, pool.get()));
   image.metadata.m.color_encoding = hlg;
-  JXL_CHECK(jxl::EncodeToFile(image, output_filename, &pool));
+  JXL_CHECK(
+      jpegxl::tools::Encode(image, output_filename, &encoded, pool.get()));
+  JXL_CHECK(jpegxl::tools::WriteFile(output_filename, encoded));
 }

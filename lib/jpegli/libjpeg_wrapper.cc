@@ -7,11 +7,6 @@
 // shared library that is API- and ABI-compatible with libjpeg-turbo's version
 // of libjpeg.so.
 
-/* clang-format off */
-#include <stdio.h>
-#include <jpeglib.h>
-/* clang-format on */
-
 #include "lib/jpegli/common.h"
 #include "lib/jpegli/decode.h"
 #include "lib/jpegli/encode.h"
@@ -43,7 +38,7 @@ void jpeg_stdio_src(j_decompress_ptr cinfo, FILE *infile) {
 }
 
 void jpeg_mem_src(j_decompress_ptr cinfo, const unsigned char *inbuffer,
-                  unsigned long insize) {
+                  unsigned long insize /* NOLINT */) {
   jpegli_mem_src(cinfo, inbuffer, insize);
 }
 
@@ -102,6 +97,11 @@ int jpeg_consume_input(j_decompress_ptr cinfo) {
   return jpegli_consume_input(cinfo);
 }
 
+#if JPEG_LIB_VERSION >= 80
+void jpeg_core_output_dimensions(j_decompress_ptr cinfo) {
+  jpegli_core_output_dimensions(cinfo);
+}
+#endif
 void jpeg_calc_output_dimensions(j_decompress_ptr cinfo) {
   jpegli_calc_output_dimensions(cinfo);
 }
@@ -122,11 +122,11 @@ boolean jpeg_read_icc_profile(j_decompress_ptr cinfo, JOCTET **icc_data_ptr,
 }
 
 void jpeg_abort_decompress(j_decompress_ptr cinfo) {
-  return jpegli_abort_decompress(cinfo);
+  jpegli_abort_decompress(cinfo);
 }
 
 void jpeg_destroy_decompress(j_decompress_ptr cinfo) {
-  return jpegli_destroy_decompress(cinfo);
+  jpegli_destroy_decompress(cinfo);
 }
 
 void jpeg_CreateCompress(j_compress_ptr cinfo, int version, size_t structsize) {
@@ -138,7 +138,7 @@ void jpeg_stdio_dest(j_compress_ptr cinfo, FILE *outfile) {
 }
 
 void jpeg_mem_dest(j_compress_ptr cinfo, unsigned char **outbuffer,
-                   unsigned long *outsize) {
+                   unsigned long *outsize /* NOLINT */) {
   jpegli_mem_dest(cinfo, outbuffer, outsize);
 }
 
@@ -162,6 +162,12 @@ void jpeg_set_linear_quality(j_compress_ptr cinfo, int scale_factor,
   jpegli_set_linear_quality(cinfo, scale_factor, force_baseline);
 }
 
+#if JPEG_LIB_VERSION >= 70
+void jpeg_default_qtables(j_compress_ptr cinfo, boolean force_baseline) {
+  jpegli_default_qtables(cinfo, force_baseline);
+}
+#endif
+
 int jpeg_quality_scaling(int quality) {
   return jpegli_quality_scaling(quality);
 }
@@ -180,6 +186,12 @@ void jpeg_simple_progression(j_compress_ptr cinfo) {
 void jpeg_suppress_tables(j_compress_ptr cinfo, boolean suppress) {
   jpegli_suppress_tables(cinfo, suppress);
 }
+
+#if JPEG_LIB_VERSION >= 70
+void jpeg_calc_jpeg_dimensions(j_compress_ptr cinfo) {
+  jpegli_calc_jpeg_dimensions(cinfo);
+}
+#endif
 
 void jpeg_copy_critical_parameters(j_decompress_ptr srcinfo,
                                    j_compress_ptr dstinfo) {

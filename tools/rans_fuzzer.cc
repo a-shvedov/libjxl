@@ -3,34 +3,45 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include "lib/jxl/dec_ans.h"
-#include "lib/jxl/entropy_coder.h"
+#include <jxl/memory_manager.h>
 
-namespace jpegxl {
-namespace tools {
+#include <cstddef>
+#include <cstdint>
+
+#include "lib/jxl/base/common.h"
+#include "lib/jxl/base/span.h"
+#include "lib/jxl/base/status.h"
+#include "lib/jxl/dec_ans.h"
+#include "lib/jxl/dec_bit_reader.h"
+#include "lib/jxl/fuzztest.h"
+#include "lib/jxl/test_memory_manager.h"
+
+namespace {
 
 using ::jxl::ANSCode;
 using ::jxl::ANSSymbolReader;
 using ::jxl::BitReader;
 using ::jxl::BitReaderScopedCloser;
-using ::jxl::Span;
+using ::jxl::Bytes;
 using ::jxl::Status;
 
-int TestOneInput(const uint8_t* data, size_t size) {
+int DoTestOneInput(const uint8_t* data, size_t size) {
   if (size < 2) return 0;
   size_t numContexts = data[0] * 256 * data[1] + 1;
   data += 2;
   size -= 2;
 
   std::vector<uint8_t> context_map;
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
   Status ret = true;
   {
-    BitReader br(Span<const uint8_t>(data, size));
+    BitReader br(Bytes(data, size));
     BitReaderScopedCloser br_closer(&br, &ret);
     ANSCode code;
-    JXL_RETURN_IF_ERROR(
-        DecodeHistograms(&br, numContexts, &code, &context_map));
-    ANSSymbolReader ansreader(&code, &br);
+    JXL_RETURN_IF_ERROR(DecodeHistograms(memory_manager, &br, numContexts,
+                                         &code, &context_map));
+    JXL_ASSIGN_OR_DIE(ANSSymbolReader ansreader,
+                      ANSSymbolReader::Create(&code, &br));
 
     // Limit the maximum amount of reads to avoid (valid) infinite loops.
     const size_t maxreads = size * 8;
@@ -47,9 +58,14 @@ int TestOneInput(const uint8_t* data, size_t size) {
   return 0;
 }
 
-}  // namespace tools
-}  // namespace jpegxl
+}  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-  return jpegxl::tools::TestOneInput(data, size);
+  return DoTestOneInput(data, size);
 }
+
+void TestOneInput(const std::vector<uint8_t>& data) {
+  DoTestOneInput(data.data(), data.size());
+}
+
+FUZZ_TEST(RansFuzzTest, TestOneInput);

@@ -113,7 +113,7 @@ struct BenchmarkArgs {
   bool silent_errors;
   bool save_compressed;
   bool save_decompressed;
-  std::string output_extension;    // see CodecFromExtension
+  std::string output_extension;    // see CodecFromPath
   std::string output_description;  // see ParseDescription
   ColorEncoding output_encoding;   // determined by output_description
 
@@ -146,13 +146,13 @@ struct BenchmarkArgs {
   int inner_threads;
   size_t decode_reps;
   size_t encode_reps;
+  size_t generations;
 
   std::string sample_tmp_dir;
 
   int num_samples;
   int sample_dimensions;
 
-  bool profiler;
   double error_pnorm;
   bool show_progress;
 

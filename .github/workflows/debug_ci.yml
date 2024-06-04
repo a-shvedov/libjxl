@@ -11,12 +11,15 @@ on:
     branches:
       - ci-*-debug
 
+permissions:
+  contents: read
+
 jobs:
   cross_compile_ubuntu:
-    name: Cross-compiling ${{ matrix.build_target }} ${{ matrix.variant }} 
-    runs-on: [ubuntu-22.04]
+    name: Cross-compiling ${{ matrix.build_target }} ${{ matrix.variant }}
+    runs-on: [ubuntu-latest]
     container:
-      image: debian:bullseye
+      image: debian:bookworm
     strategy:
       fail-fast: false
       matrix:
@@ -28,6 +31,11 @@ jobs:
       BUILD_DIR: build
 
     steps:
+    - name: Harden Runner
+      uses: step-security/harden-runner@f086349bfa2bd1361f7909c78558e816508cdc10 # v2.8.0
+      with:
+        egress-policy: audit
+
     - name: Setup apt
       shell: bash
       run: |
@@ -116,7 +124,7 @@ jobs:
         echo "CC=${{ matrix.c_compiler || 'clang-11' }}" >> $GITHUB_ENV
         echo "CXX=${{ matrix.cxx_compiler || 'clang++-11' }}" >> $GITHUB_ENV
     - name: Checkout the source
-      uses: actions/checkout@v2
+      uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
       with:
         submodules: true
         fetch-depth: 1
@@ -130,7 +138,8 @@ jobs:
         SKIP_BUILD: 1
         BUILD_TARGET: ${{ matrix.build_target }}
     - name: Setup tmate session
-      uses: mxschmitt/action-tmate@v3
+      uses: mxschmitt/action-tmate@b3db6e16e597d92037c8647e54acc5d2b1b48dee # v3.18
+      timeout-minutes: 15
 
 
 

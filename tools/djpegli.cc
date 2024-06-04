@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "lib/extras/dec/jpegli.h"
+#include "lib/extras/enc/apng.h"
 #include "lib/extras/enc/encode.h"
 #include "lib/extras/time.h"
 #include "lib/jxl/base/printf_macros.h"
@@ -24,17 +25,13 @@ namespace {
 
 struct Args {
   void AddCommandLineOptions(CommandLineParser* cmdline) {
+    std::string output_help("The output can be ");
+    output_help.append(jxl::extras::ListOfEncodeCodecs());
     cmdline->AddPositionalOption("INPUT", /* required = */ true,
-                                 "The JPG input file.", &file_in);
+                                 "The JPEG input file.", &file_in);
 
-    cmdline->AddPositionalOption("OUTPUT", /* required = */ true,
-                                 "The output can be "
-#if JPEGXL_ENABLE_APNG
-                                 "PNG, "
-#endif
-                                 "PFM or PPM/PGM/PNM",
+    cmdline->AddPositionalOption("OUTPUT", /* required = */ true, output_help,
                                  &file_out);
-
     cmdline->AddOptionFlag('\0', "disable_output",
                            "No output file will be written (for benchmarking)",
                            &disable_output, &SetBooleanTrue);
@@ -118,7 +115,7 @@ int DJpegliMain(int argc, const char* argv[]) {
   }
 
   std::vector<uint8_t> jpeg_bytes;
-  if (!jpegxl::tools::ReadFile(args.file_in, &jpeg_bytes)) {
+  if (!ReadFile(args.file_in, &jpeg_bytes)) {
     fprintf(stderr, "Failed to read input image %s\n", args.file_in);
     return EXIT_FAILURE;
   }
@@ -175,13 +172,12 @@ int DJpegliMain(int argc, const char* argv[]) {
     return EXIT_FAILURE;
   }
   jxl::extras::EncodedImage encoded_image;
-  if (!encoder->Encode(ppf, &encoded_image) ||
+  if (!encoder->Encode(ppf, &encoded_image, nullptr) ||
       encoded_image.bitstreams.empty()) {
     fprintf(stderr, "Encode failed\n");
     return EXIT_FAILURE;
   }
-  if (!jpegxl::tools::WriteFile(filename_out.c_str(),
-                                encoded_image.bitstreams[0])) {
+  if (!WriteFile(filename_out, encoded_image.bitstreams[0])) {
     fprintf(stderr, "Failed to write output file %s\n", filename_out.c_str());
     return EXIT_FAILURE;
   }

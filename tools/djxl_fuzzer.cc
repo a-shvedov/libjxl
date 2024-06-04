@@ -3,22 +3,24 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+#include <jxl/codestream_header.h>
 #include <jxl/decode.h>
 #include <jxl/decode_cxx.h>
 #include <jxl/thread_parallel_runner.h>
 #include <jxl/thread_parallel_runner_cxx.h>
-#include <limits.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <jxl/types.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <hwy/targets.h>
 #include <map>
 #include <mutex>
 #include <random>
 #include <vector>
+
+#include "lib/jxl/fuzztest.h"
 
 namespace {
 
@@ -80,10 +82,10 @@ bool DecodeJpegXl(const uint8_t* jxl, size_t size, size_t max_pixels,
   auto dec = JxlDecoderMake(nullptr);
   if (JXL_DEC_SUCCESS !=
       JxlDecoderSubscribeEvents(
-          dec.get(), JXL_DEC_BASIC_INFO | JXL_DEC_EXTENSIONS |
-                         JXL_DEC_COLOR_ENCODING | JXL_DEC_PREVIEW_IMAGE |
-                         JXL_DEC_FRAME | JXL_DEC_FULL_IMAGE |
-                         JXL_DEC_JPEG_RECONSTRUCTION | JXL_DEC_BOX)) {
+          dec.get(), JXL_DEC_BASIC_INFO | JXL_DEC_COLOR_ENCODING |
+                         JXL_DEC_PREVIEW_IMAGE | JXL_DEC_FRAME |
+                         JXL_DEC_FULL_IMAGE | JXL_DEC_JPEG_RECONSTRUCTION |
+                         JXL_DEC_BOX)) {
     return false;
   }
   if (JXL_DEC_SUCCESS != JxlDecoderSetParallelRunner(dec.get(),
@@ -91,11 +93,12 @@ bool DecodeJpegXl(const uint8_t* jxl, size_t size, size_t max_pixels,
                                                      runner.get())) {
     return false;
   }
-  if (JXL_DEC_SUCCESS !=
-      JxlDecoderSetKeepOrientation(dec.get(), spec.keep_orientation)) {
+  if (JXL_DEC_SUCCESS != JxlDecoderSetKeepOrientation(
+                             dec.get(), TO_JXL_BOOL(spec.keep_orientation))) {
     abort();
   }
-  if (JXL_DEC_SUCCESS != JxlDecoderSetCoalescing(dec.get(), spec.coalescing)) {
+  if (JXL_DEC_SUCCESS !=
+      JxlDecoderSetCoalescing(dec.get(), TO_JXL_BOOL(spec.coalescing))) {
     abort();
   }
   JxlBasicInfo info;
@@ -110,7 +113,6 @@ bool DecodeJpegXl(const uint8_t* jxl, size_t size, size_t max_pixels,
   }
 
   bool seen_basic_info = false;
-  bool seen_extensions = false;
   bool seen_color_encoding = false;
   bool seen_preview = false;
   bool seen_need_image_out = false;
@@ -212,6 +214,7 @@ bool DecodeJpegXl(const uint8_t* jxl, size_t size, size_t max_pixels,
         return false;
       }
     } else if (status == JXL_DEC_JPEG_NEED_MORE_OUTPUT) {
+      if (want_preview) abort();  // expected preview before frame
       if (spec.jpeg_to_pixels) abort();
       if (!seen_jpeg_reconstruction) abort();
       seen_jpeg_need_more_output = true;
@@ -273,12 +276,6 @@ bool DecodeJpegXl(const uint8_t* jxl, size_t size, size_t max_pixels,
         }
         Consume(ec_name.cbegin(), ec_name.cend());
       }
-    } else if (status == JXL_DEC_EXTENSIONS) {
-      if (!seen_basic_info) abort();     // expected basic info first
-      if (seen_color_encoding) abort();  // should happen after this
-      if (seen_extensions) abort();      // already seen extensions
-      seen_extensions = true;
-      // TODO(eustas): get extensions?
     } else if (status == JXL_DEC_COLOR_ENCODING) {
       if (!seen_basic_info) abort();     // expected basic info first
       if (seen_color_encoding) abort();  // already seen color encoding
@@ -287,14 +284,13 @@ bool DecodeJpegXl(const uint8_t* jxl, size_t size, size_t max_pixels,
       // Get the ICC color profile of the pixel data
       size_t icc_size;
       if (JXL_DEC_SUCCESS !=
-          JxlDecoderGetICCProfileSize(
-              dec.get(), &format, JXL_COLOR_PROFILE_TARGET_DATA, &icc_size)) {
+          JxlDecoderGetICCProfileSize(dec.get(), JXL_COLOR_PROFILE_TARGET_DATA,
+                                      &icc_size)) {
         return false;
       }
       icc_profile->resize(icc_size);
       if (JXL_DEC_SUCCESS != JxlDecoderGetColorAsICCProfile(
-                                 dec.get(), &format,
-                                 JXL_COLOR_PROFILE_TARGET_DATA,
+                                 dec.get(), JXL_COLOR_PROFILE_TARGET_DATA,
                                  icc_profile->data(), icc_profile->size())) {
         return false;
       }
@@ -312,6 +308,7 @@ bool DecodeJpegXl(const uint8_t* jxl, size_t size, size_t max_pixels,
         }
       }
     } else if (status == JXL_DEC_PREVIEW_IMAGE) {
+      // TODO(eustas): test JXL_DEC_NEED_PREVIEW_OUT_BUFFER
       if (seen_preview) abort();
       if (!want_preview) abort();
       if (!seen_color_encoding) abort();
@@ -394,7 +391,7 @@ bool DecodeJpegXl(const uint8_t* jxl, size_t size, size_t max_pixels,
           return false;
         }
         pixels->resize(buffer_size);
-        void* pixels_buffer = (void*)pixels->data();
+        void* pixels_buffer = static_cast<void*>(pixels->data());
         size_t pixels_buffer_size = pixels->size();
         if (JXL_DEC_SUCCESS !=
             JxlDecoderSetImageOutBuffer(dec.get(), &format, pixels_buffer,
@@ -403,7 +400,10 @@ bool DecodeJpegXl(const uint8_t* jxl, size_t size, size_t max_pixels,
         }
       }
     } else if (status == JXL_DEC_JPEG_RECONSTRUCTION) {
-      if (want_preview) abort();  // expected preview before frame
+      // Do not check preview precedence here, since this event only declares
+      // that JPEG is going to be decoded; though, when first byte of JPEG
+      // arrives (JXL_DEC_JPEG_NEED_MORE_OUTPUT) it is certain that preview
+      // should have been produced already.
       if (seen_jpeg_reconstruction) abort();
       seen_jpeg_reconstruction = true;
       if (!spec.jpeg_to_pixels) {
@@ -512,7 +512,7 @@ bool DecodeJpegXl(const uint8_t* jxl, size_t size, size_t max_pixels,
   }
 }
 
-int TestOneInput(const uint8_t* data, size_t size) {
+int DoTestOneInput(const uint8_t* data, size_t size) {
   if (size < 4) return 0;
   uint32_t flags = 0;
   size_t used_flag_bits = 0;
@@ -530,27 +530,31 @@ int TestOneInput(const uint8_t* data, size_t size) {
     flags /= limit;
     return result % (max_value + 1);
   };
+  const auto getBoolFlag = [&getFlag]() -> bool {
+    return static_cast<bool>(getFlag(1));
+  };
 
   FuzzSpec spec;
   // Allows some different possible variations in the chunk sizes of the
   // streaming case
   spec.random_seed = flags ^ size;
-  spec.get_alpha = !!getFlag(1);
-  spec.get_grayscale = !!getFlag(1);
-  spec.use_streaming = !!getFlag(1);
-  spec.jpeg_to_pixels = !!getFlag(1);
-  spec.use_callback = !!getFlag(1);
-  spec.keep_orientation = !!getFlag(1);
-  spec.coalescing = !!getFlag(1);
+  spec.get_alpha = getBoolFlag();
+  spec.get_grayscale = getBoolFlag();
+  spec.use_streaming = getBoolFlag();
+  spec.jpeg_to_pixels = getBoolFlag();
+  spec.use_callback = getBoolFlag();
+  spec.keep_orientation = getBoolFlag();
+  spec.coalescing = getBoolFlag();
   spec.output_type = static_cast<JxlDataType>(getFlag(JXL_TYPE_FLOAT16));
   spec.output_endianness = static_cast<JxlEndianness>(getFlag(JXL_BIG_ENDIAN));
   spec.output_align = getFlag(16);
-  spec.decode_boxes = !!getFlag(1);
+  spec.decode_boxes = getBoolFlag();
 
   std::vector<uint8_t> pixels;
   std::vector<uint8_t> jpeg;
   std::vector<uint8_t> icc;
-  size_t xsize, ysize;
+  size_t xsize;
+  size_t ysize;
   size_t max_pixels = 1 << 21;
 
   const auto targets = hwy::SupportedAndGeneratedTargets();
@@ -565,5 +569,11 @@ int TestOneInput(const uint8_t* data, size_t size) {
 }  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-  return TestOneInput(data, size);
+  return DoTestOneInput(data, size);
 }
+
+void TestOneInput(const std::vector<uint8_t>& data) {
+  DoTestOneInput(data.data(), data.size());
+}
+
+FUZZ_TEST(DjxlFuzzTest, TestOneInput);

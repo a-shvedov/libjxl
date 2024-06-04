@@ -9,10 +9,9 @@
 
 #include <vector>
 
-#include "lib/extras/codec.h"
+#include "lib/extras/dec/decode.h"
 #include "lib/extras/enc/jpegli.h"
 #include "lib/extras/time.h"
-#include "lib/jpegli/encode.h"
 #include "lib/jxl/base/printf_macros.h"
 #include "lib/jxl/base/span.h"
 #include "tools/args.h"
@@ -26,21 +25,12 @@ namespace {
 
 struct Args {
   void AddCommandLineOptions(CommandLineParser* cmdline) {
-    cmdline->AddPositionalOption("INPUT", /* required = */ true,
-                                 "the input can be "
-#if JPEGXL_ENABLE_APNG
-                                 "PNG, APNG, "
-#endif
-#if JPEGXL_ENABLE_GIF
-                                 "GIF, "
-#endif
-#if JPEGXL_ENABLE_EXR
-                                 "EXR, "
-#endif
-                                 "PPM, PFM, or PGX",
+    std::string input_help("the input can be ");
+    input_help.append(jxl::extras::ListOfDecodeCodecs());
+    cmdline->AddPositionalOption("INPUT", /* required = */ true, input_help,
                                  &file_in);
     cmdline->AddPositionalOption("OUTPUT", /* required = */ true,
-                                 "the compressed JPG output file", &file_out);
+                                 "the compressed JPEG output file", &file_out);
 
     cmdline->AddOptionFlag('\0', "disable_output",
                            "No output file will be written (for benchmarking)",
@@ -50,7 +40,7 @@ struct Args {
         'x', "dec-hints", "key=value",
         "color_space indicates the ColorEncoding, see Description();\n"
         "    icc_pathname refers to a binary file containing an ICC profile.",
-        &color_hints, &ParseAndAppendKeyValue<jxl::extras::ColorHints>, 1);
+        &color_hints_proxy, &ParseAndAppendKeyValue<ColorHintsProxy>, 1);
 
     opt_distance_id = cmdline->AddOptionValue(
         'd', "distance", "maxError",
@@ -65,7 +55,7 @@ struct Args {
         "Quality setting (is remapped to --distance)."
         "    Default is quality 90.\n"
         "    Quality values roughly match libjpeg quality.\n"
-        "    Recommended range: 68 .. 96. Allowed range: 0 .. 100.\n"
+        "    Recommended range: 68 .. 96. Allowed range: 1 .. 100.\n"
         "    Mutually exclusive with --distance and --target_size.",
         &quality, &ParseSigned);
 
@@ -119,7 +109,7 @@ struct Args {
   const char* file_in = nullptr;
   const char* file_out = nullptr;
   bool disable_output = false;
-  jxl::extras::ColorHints color_hints;
+  ColorHintsProxy color_hints_proxy;
   jxl::extras::JpegSettings settings;
   int quality = 90;
   size_t num_reps = 1;
@@ -136,7 +126,7 @@ bool ValidateArgs(const Args& args) {
     fprintf(stderr, "Invalid --distance argument\n");
     return false;
   }
-  if (args.quality < 0 || args.quality > 100) {
+  if (args.quality <= 0 || args.quality > 100) {
     fprintf(stderr, "Invalid --quality argument\n");
     return false;
   }
@@ -169,7 +159,7 @@ bool SetDistance(const Args& args, const CommandLineParser& cmdline,
     return false;
   }
   if (quality_set) {
-    settings->distance = jpegli_quality_to_distance(args.quality);
+    settings->quality = args.quality;
   }
   return true;
 }
@@ -202,14 +192,14 @@ int CJpegliMain(int argc, const char* argv[]) {
   }
 
   std::vector<uint8_t> input_bytes;
-  if (!jpegxl::tools::ReadFile(args.file_in, &input_bytes)) {
+  if (!ReadFile(args.file_in, &input_bytes)) {
     fprintf(stderr, "Failed to read input image %s\n", args.file_in);
     return EXIT_FAILURE;
   }
 
   jxl::extras::PackedPixelFile ppf;
-  if (!jxl::extras::DecodeBytes(jxl::Span<const uint8_t>(input_bytes),
-                                args.color_hints, &ppf)) {
+  if (!jxl::extras::DecodeBytes(jxl::Bytes(input_bytes),
+                                args.color_hints_proxy.target, &ppf)) {
     fprintf(stderr, "Failed to decode input image %s\n", args.file_in);
     return EXIT_FAILURE;
   }
@@ -246,7 +236,7 @@ int CJpegliMain(int argc, const char* argv[]) {
   }
 
   if (args.file_out && !args.disable_output) {
-    if (!jpegxl::tools::WriteFile(args.file_out, jpeg_bytes)) {
+    if (!WriteFile(args.file_out, jpeg_bytes)) {
       fprintf(stderr, "Could not write jpeg to %s\n", args.file_out);
       return EXIT_FAILURE;
     }

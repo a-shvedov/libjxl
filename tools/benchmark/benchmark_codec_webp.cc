@@ -4,27 +4,32 @@
 // license that can be found in the LICENSE file.
 #include "tools/benchmark/benchmark_codec_webp.h"
 
-#include <stdint.h>
-#include <string.h>
+#include <jxl/cms.h>
+#include <jxl/types.h>
 #include <webp/decode.h>
 #include <webp/encode.h>
 
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
+#include "lib/extras/packed_image_convert.h"
 #include "lib/extras/time.h"
-#include "lib/jxl/base/compiler_specific.h"
+#include "lib/jxl/base/common.h"
 #include "lib/jxl/base/data_parallel.h"
-#include "lib/jxl/base/padded_bytes.h"
+#include "lib/jxl/base/sanitizers.h"
 #include "lib/jxl/base/span.h"
-#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/base/status.h"
 #include "lib/jxl/dec_external_image.h"
-#include "lib/jxl/enc_color_management.h"
 #include "lib/jxl/enc_external_image.h"
 #include "lib/jxl/enc_image_bundle.h"
-#include "lib/jxl/image.h"
 #include "lib/jxl/image_bundle.h"
-#include "lib/jxl/sanitizers.h"
+#include "lib/jxl/image_metadata.h"
+#include "tools/benchmark/benchmark_args.h"
+#include "tools/benchmark/benchmark_codec.h"
+#include "tools/no_memory_manager.h"
+#include "tools/speed_stats.h"
 #include "tools/thread_pool_internal.h"
 
 namespace jpegxl {
@@ -89,9 +94,18 @@ class WebPCodec : public ImageCodec {
     return false;
   }
 
-  Status Compress(const std::string& filename, const CodecInOut* io,
+  Status Compress(const std::string& filename, const PackedPixelFile& ppf,
                   ThreadPool* pool, std::vector<uint8_t>* compressed,
                   jpegxl::tools::SpeedStats* speed_stats) override {
+    CodecInOut io{jpegxl::tools::NoMemoryManager()};
+    JXL_RETURN_IF_ERROR(
+        jxl::extras::ConvertPackedPixelFileToCodecInOut(ppf, pool, &io));
+    return Compress(filename, &io, pool, compressed, speed_stats);
+  }
+
+  Status Compress(const std::string& filename, const CodecInOut* io,
+                  ThreadPool* pool, std::vector<uint8_t>* compressed,
+                  jpegxl::tools::SpeedStats* speed_stats) {
     const double start = jxl::Now();
     const ImageBundle& ib = io->Main();
 
@@ -101,11 +115,11 @@ class WebPCodec : public ImageCodec {
 
     size_t num_chans = (ib.HasAlpha() ? 4 : 3);
     ImageMetadata metadata = io->metadata.m;
-    ImageBundle store(&metadata);
+    ImageBundle store(jpegxl::tools::NoMemoryManager(), &metadata);
     const ImageBundle* transformed;
     const ColorEncoding& c_desired = ColorEncoding::SRGB(false);
-    JXL_RETURN_IF_ERROR(jxl::TransformIfNeeded(ib, c_desired, jxl::GetJxlCms(),
-                                               pool, &store, &transformed));
+    JXL_RETURN_IF_ERROR(jxl::TransformIfNeeded(
+        ib, c_desired, *JxlGetDefaultCms(), pool, &store, &transformed));
     size_t xsize = ib.oriented_xsize();
     size_t ysize = ib.oriented_ysize();
     size_t stride = xsize * num_chans;
@@ -165,8 +179,19 @@ class WebPCodec : public ImageCodec {
 
   Status Decompress(const std::string& filename,
                     const Span<const uint8_t> compressed, ThreadPool* pool,
-                    CodecInOut* io,
+                    PackedPixelFile* ppf,
                     jpegxl::tools::SpeedStats* speed_stats) override {
+    CodecInOut io{jpegxl::tools::NoMemoryManager()};
+    JXL_RETURN_IF_ERROR(
+        Decompress(filename, compressed, pool, &io, speed_stats));
+    JxlPixelFormat format{0, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+    return jxl::extras::ConvertCodecInOutToPackedPixelFile(
+        io, format, io.Main().c_current(), pool, ppf);
+  };
+
+  Status Decompress(const std::string& filename,
+                    const Span<const uint8_t> compressed, ThreadPool* pool,
+                    CodecInOut* io, jpegxl::tools::SpeedStats* speed_stats) {
     WebPDecoderConfig config;
 #ifdef MEMORY_SANITIZER
     // config is initialized by libwebp, which we are not instrumenting with
@@ -206,6 +231,7 @@ class WebPCodec : public ImageCodec {
       return JXL_FAILURE("Color profile is-gray mismatch");
     }
     io->metadata.m.SetAlphaBits(8);
+    io->SetSize(buf->width, buf->height);
     const Status ok = FromSRGB(buf->width, buf->height, is_gray, has_alpha,
                                /*is_16bit=*/false, JXL_LITTLE_ENDIAN,
                                data_begin, data_end, pool, &io->Main());
@@ -228,12 +254,14 @@ class WebPCodec : public ImageCodec {
   }
   Status CompressInternal(const std::vector<uint8_t>& srgb, size_t xsize,
                           size_t ysize, size_t num_chans, int quality,
-                          std::vector<uint8_t>* compressed) {
+                          std::vector<uint8_t>* compressed) const {
     compressed->clear();
     WebPConfig config;
-    WebPConfigInit(&config);
+    if (!WebPConfigInit(&config)) {
+      return JXL_FAILURE("WebPConfigInit failed");
+    }
     JXL_ASSERT(!lossless_ || !near_lossless_);  // can't have both
-    config.lossless = lossless_;
+    config.lossless = lossless_ ? 1 : 0;
     config.quality = quality;
     config.method = method_;
 #if WEBP_ENCODER_ABI_VERSION >= 0x020a
@@ -246,7 +274,9 @@ class WebPCodec : public ImageCodec {
     JXL_CHECK(WebPValidateConfig(&config));
 
     WebPPicture pic;
-    WebPPictureInit(&pic);
+    if (!WebPPictureInit(&pic)) {
+      return JXL_FAILURE("WebPPictureInit failed");
+    }
     pic.width = static_cast<int>(xsize);
     pic.height = static_cast<int>(ysize);
     pic.writer = &WebPStringWrite;
@@ -254,14 +284,18 @@ class WebPCodec : public ImageCodec {
     pic.custom_ptr = compressed;
 
     if (num_chans == 3) {
-      WebPPictureImportRGB(&pic, srgb.data(), 3 * xsize);
+      if (!WebPPictureImportRGB(&pic, srgb.data(), 3 * xsize)) {
+        return JXL_FAILURE("WebPPictureImportRGB failed");
+      }
     } else {
-      WebPPictureImportRGBA(&pic, srgb.data(), 4 * xsize);
+      if (!WebPPictureImportRGBA(&pic, srgb.data(), 4 * xsize)) {
+        return JXL_FAILURE("WebPPictureImportRGBA failed");
+      }
     }
 
     // WebP encoding may fail, for example, if the image is more than 16384
     // pixels high or wide.
-    bool ok = WebPEncode(&config, &pic);
+    bool ok = FROM_JXL_BOOL(WebPEncode(&config, &pic));
     WebPPictureFree(&pic);
     // Compressed image data is initialized by libwebp, which we are not
     // instrumenting with msan.
@@ -272,7 +306,7 @@ class WebPCodec : public ImageCodec {
   int quality_ = 90;
   bool lossless_ = false;
   bool near_lossless_ = false;
-  bool near_lossless_quality_ = 40;  // only used if near_lossless_
+  int near_lossless_quality_ = 40;   // only used if near_lossless_
   int method_ = 6;                   // smallest, some speed cost
 };
 

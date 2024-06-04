@@ -3,32 +3,41 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include <stdint.h>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 
+#include "lib/jxl/base/bits.h"
+#include "lib/jxl/base/common.h"
 #include "lib/jxl/base/random.h"
+#include "lib/jxl/base/span.h"
+#include "lib/jxl/base/status.h"
 #include "lib/jxl/dec_bit_reader.h"
+#include "lib/jxl/fields.h"
+#include "lib/jxl/fuzztest.h"
 #include "lib/jxl/modular/encoding/encoding.h"
+#include "lib/jxl/modular/modular_image.h"
+#include "lib/jxl/modular/options.h"
 #include "lib/jxl/modular/transform/transform.h"
+#include "tools/no_memory_manager.h"
 
-namespace jpegxl {
-namespace tools {
+namespace {
 
 using ::jxl::BitReader;
 using ::jxl::BitReaderScopedCloser;
+using ::jxl::Bytes;
 using ::jxl::Channel;
 using ::jxl::GroupHeader;
 using ::jxl::Image;
 using ::jxl::ModularOptions;
 using ::jxl::pixel_type;
 using ::jxl::Rng;
-using ::jxl::Span;
 using ::jxl::Status;
 using ::jxl::Transform;
 using ::jxl::weighted::Header;
 
-namespace {
 void FillChannel(Channel& ch, Rng& rng) {
-  auto p = &ch.plane;
+  auto* p = &ch.plane;
   const size_t w = ch.w;
   const size_t h = ch.h;
   for (size_t y = 0; y < h; ++y) {
@@ -42,11 +51,11 @@ template <typename T>
 void AssertEq(T a, T b) {
   if (a != b) __builtin_trap();
 }
-}  // namespace
 
-int TestOneInput(const uint8_t* data, size_t size) {
+int DoTestOneInput(const uint8_t* data, size_t size) {
+  if (size < 15) return 0;
   static Status nevermind = true;
-  BitReader reader(Span<const uint8_t>(data, size));
+  BitReader reader(Bytes(data, size));
   BitReaderScopedCloser reader_closer(&reader, &nevermind);
 
   Rng rng(reader.ReadFixedBits<56>());
@@ -88,13 +97,16 @@ int TestOneInput(const uint8_t* data, size_t size) {
     ec_upsampling.push_back(1 << log_ec_upsampling);
   }
 
-  Image image(w, h, bit_depth, nb_chans + nb_extra);
+  JXL_ASSIGN_OR_DIE(Image image,
+                    Image::Create(jpegxl::tools::NoMemoryManager(), w, h,
+                                  bit_depth, nb_chans + nb_extra));
 
   for (size_t c = 0; c < nb_chans; c++) {
     Channel& ch = image.channel[c];
     ch.hshift = hshift[c];
     ch.vshift = vshift[c];
-    ch.shrink(jxl::DivCeil(w, 1 << hshift[c]), jxl::DivCeil(h, 1 << vshift[c]));
+    JXL_CHECK(ch.shrink(jxl::DivCeil(w, 1 << hshift[c]),
+                        jxl::DivCeil(h, 1 << vshift[c])));
   }
 
   for (size_t ec = 0; ec < nb_extra; ec++) {
@@ -102,7 +114,8 @@ int TestOneInput(const uint8_t* data, size_t size) {
     size_t ch_up = ec_upsampling[ec];
     int up_level =
         jxl::CeilLog2Nonzero(ch_up) - jxl::CeilLog2Nonzero(upsampling);
-    ch.shrink(jxl::DivCeil(w_orig, ch_up), jxl::DivCeil(h_orig, ch_up));
+    JXL_CHECK(
+        ch.shrink(jxl::DivCeil(w_orig, ch_up), jxl::DivCeil(h_orig, ch_up)));
     ch.hshift = ch.vshift = up_level;
   }
 
@@ -123,8 +136,8 @@ int TestOneInput(const uint8_t* data, size_t size) {
   ModularOptions options;
   if (!ValidateChannelDimensions(image, options)) return 0;
 
-  for (size_t i = 0; i < image.channel.size(); ++i) {
-    FillChannel(image.channel[i], rng);
+  for (Channel& ch : image.channel) {
+    FillChannel(ch, rng);
   }
 
   image.undo_transforms(w_header);
@@ -155,9 +168,14 @@ int TestOneInput(const uint8_t* data, size_t size) {
   return 0;
 }
 
-}  // namespace tools
-}  // namespace jpegxl
+}  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-  return jpegxl::tools::TestOneInput(data, size);
+  return DoTestOneInput(data, size);
 }
+
+void TestOneInput(const std::vector<uint8_t>& data) {
+  DoTestOneInput(data.data(), data.size());
+}
+
+FUZZ_TEST(TransformsFuzzTest, TestOneInput);

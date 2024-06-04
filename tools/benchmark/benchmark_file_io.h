@@ -12,7 +12,6 @@
 #include <string>
 #include <vector>
 
-#include "lib/jxl/base/file_io.h"
 #include "lib/jxl/base/status.h"
 
 namespace jpegxl {
